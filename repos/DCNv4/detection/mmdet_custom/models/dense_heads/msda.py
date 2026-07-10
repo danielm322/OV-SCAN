@@ -88,6 +88,7 @@ class MultiScaleDeformableAttnFunction_fp16(Function):
 
 
 shm_size_dict = {
+    "12.0": 227000,
     "8.0": 163000,
     "8.6": 99000,
     "8.7": 163000,

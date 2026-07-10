@@ -43,6 +43,7 @@ exec:
 		-v ${DATASET_ROOT}:${DATASET_ROOT} \
 		-v $${PWD}/repos:/OV-SCAN/repos \
 		-v $${PWD}/datasets:/OV-SCAN/datasets \
+		-v $${PWD}/pretrained:/OV-SCAN/pretrained \
 		-v $${PWD}/setup.sh:/OV-SCAN/setup.sh \
 		-v $${PWD}/docker/.bashrc:/root/.bashrc \
 		-v $${PWD}/docker/.bash_history:/root/.bash_history \
