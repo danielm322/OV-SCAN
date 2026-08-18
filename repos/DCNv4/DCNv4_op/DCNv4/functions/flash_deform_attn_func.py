@@ -19,6 +19,7 @@ import numpy as np
 from DCNv4 import ext
 
 shm_size_dict = {
+    "12.0": 227000,
     "8.0": 163000,
     "8.6": 99000,
     "8.7": 163000,

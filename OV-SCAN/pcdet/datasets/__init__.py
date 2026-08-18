@@ -8,11 +8,13 @@ from pcdet.utils import common_utils
 from .dataset import DatasetTemplate
 from .nuscenes.nuscenes_dataset import NuScenesDataset
 from .nuscenes.nuscenes_ov_dataset import NuScenesOVDataset
+from .kitti.kitti_dataset import KittiDataset
 
 __all__ = {
     'DatasetTemplate': DatasetTemplate,
     'NuScenesDataset': NuScenesDataset,
     'NuScenesOVDataset': NuScenesOVDataset,
+    'KittiDataset': KittiDataset,
 }
 
 
