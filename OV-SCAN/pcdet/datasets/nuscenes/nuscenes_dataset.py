@@ -415,10 +415,11 @@ def create_nuscenes_info(version, data_path, save_path, max_sweeps=10, with_cam=
     from nuscenes.utils import splits
     from . import nuscenes_utils
 
-    data_path = data_path / version
+    # NuScenes() appends /version to dataroot itself, and stored info paths (e.g. 'samples/LIDAR_TOP/...')
+    # are relative to the un-suffixed root too -- only the saved pkl itself lives under <root>/<version>/.
     save_path = save_path / version
 
-    assert version in ['v1.0-trainval', 'v1.0-test', 'v1.0-mini']
+    assert version in ['v1.0-trainval', 'v1.0-test', 'v1.0-mini', 'v1.0-custom']
     if version == 'v1.0-trainval':
         train_scenes = splits.train
         val_scenes = splits.val
@@ -428,11 +429,19 @@ def create_nuscenes_info(version, data_path, save_path, max_sweeps=10, with_cam=
     elif version == 'v1.0-mini':
         train_scenes = splits.mini_train
         val_scenes = splits.mini_val
+    elif version == 'v1.0-custom':
+        # Non-official dataset (e.g. converted from a third-party source): scene names won't
+        # appear in nuscenes-devkit's hardcoded official splits, so treat every available scene
+        # as a val scene instead of filtering against splits.*.
+        train_scenes = []
+        val_scenes = None
     else:
         raise NotImplementedError
     nusc = NuScenes(version=version, dataroot=data_path, verbose=True)
     available_scenes = nuscenes_utils.get_available_scenes(nusc)
     available_scene_names = [s['name'] for s in available_scenes]
+    if version == 'v1.0-custom':
+        val_scenes = available_scene_names
     train_scenes = list(filter(lambda x: x in available_scene_names, train_scenes))
     val_scenes = list(filter(lambda x: x in available_scene_names, val_scenes))
     train_scenes = set([available_scenes[available_scene_names.index(s)]['token'] for s in train_scenes])

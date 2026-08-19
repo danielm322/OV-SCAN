@@ -285,13 +285,15 @@ class OVScanHead(nn.Module):
         self.clip_texts = [self.clip_prompt_template.replace('CLASS', class_name) for class_name in self.ov_classes]
         self.text_inputs = self.clip_tokenizer(self.clip_texts, context_length=self.clip_context_length)
         clip_model.eval().cuda()
-        self.text_features = clip_model.encode_text(self.text_inputs.cuda()).detach()
+        with torch.no_grad():
+            self.text_features = clip_model.encode_text(self.text_inputs.cuda()).detach()
         self.text_features = self.text_features / self.text_features.norm(dim=-1, keepdim=True)
-        
+
         # For Alignment Head
         self.class_texts = [self.clip_prompt_template.replace('CLASS', class_name.replace('_', ' ')) for class_name in self.class_names]
         self.class_text_inputs = self.clip_tokenizer(self.class_texts, context_length=self.clip_context_length)
-        self.class_text_features = clip_model.encode_text(self.class_text_inputs.cuda()).detach()
+        with torch.no_grad():
+            self.class_text_features = clip_model.encode_text(self.class_text_inputs.cuda()).detach()
         self.class_text_features = self.class_text_features / self.class_text_features.norm(dim=-1, keepdim=True)
 
 

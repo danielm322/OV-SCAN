@@ -1,0 +1,110 @@
+CLASS_NAMES: ['car','truck', 'construction_vehicle', 'bus', 'trailer',
+              'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
+
+DATA_CONFIG:
+    _BASE_CONFIG_: cfgs/dataset_configs/urbaning_v2x_lidar_dataset.yaml
+    POINT_CLOUD_RANGE: [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
+
+MODEL:
+    NAME: OVScanLidar
+
+    VFE:
+        NAME: MeanVFE
+
+    BACKBONE_3D:
+        NAME: VoxelResBackBone8x
+        USE_BIAS: False
+
+    MAP_TO_BEV:
+        NAME: HeightCompression
+        NUM_BEV_FEATURES: 256
+
+    BACKBONE_2D:
+        NAME: BaseBEVBackbone
+        LAYER_NUMS: [5, 5]
+        LAYER_STRIDES: [1, 2]
+        NUM_FILTERS: [128, 256]
+        UPSAMPLE_STRIDES: [1, 2]
+        NUM_UPSAMPLE_FILTERS: [256, 256]
+        USE_CONV_FOR_NO_STRIDE: True
+
+
+    DENSE_HEAD:
+        NAME: OVScanHead
+        CLASS_AGNOSTIC: True
+        RETRAIN_HEAD: False
+
+        USE_BIAS_BEFORE_NORM: False
+
+        NUM_PROPOSALS: 200
+        HIDDEN_CHANNEL: 128
+        NUM_CLASSES: 10
+        NUM_HEADS: 8
+        NMS_KERNEL_SIZE: 3
+        FFN_CHANNEL: 256
+        DROPOUT: 0.1
+        BN_MOMENTUM: 0.1
+        ACTIVATION: relu
+
+        ALIGNMENT:
+          CLIP_MODEL: 'hf-hub:apple/DFN5B-CLIP-ViT-H-14'
+          TOKENIZER: 'ViT-H-14'
+          HIDDEN_DIM: 512
+          CLIP_EMBED_DIM: 1024
+          PROMPT: 'a type of CLASS.'
+          NUSCENES_TO_OV_CLASSES: {
+            "car": ["sedan", "van", "minivan", "hatchback", "suv", "coupe", "sports car", "police car", "sprinter van", "taxi"], # suv
+            "truck": ["pickup truck", "tow truck", "semi-truck", "gasoline truck", "delivery truck", "garbage truck", "fire truck", "flatbed truck", "ambulance", "cement truck", "dump truck"],
+            "bus": ["school bus", "coach bus", "double-decker bus", "transit bus", "shuttle bus", "minibus"],
+            "trailer": ["portable message board trailer", "flatbed trailer", "freight trailer", "cargo trailer"], # "trailer", "flatbed", "freight",
+            "construction_vehicle": ["excavator", "bulldozer", "forklift", "construction loader", "construction lift"],
+            "pedestrian": ["adult pedestrian", "construction worker", "child pedestrian", "police officer"],
+            "motorcycle": ["cruiser motorcycle", "touring motorcycle", "sport motorcycle", "moped"], # "motorcyclist", "vespa", "motorbike", "riding a motorcycle"
+            "bicycle": ["bicycle"],
+            "traffic_cone": ["traffic cone","traffic drum", "traffic delineator"],
+            "barrier": ["concrete jersey barrier", "plastic jersey barrier"], # "construction barrier", "traffic barricade", "jersey barrier"
+          }
+
+        NUM_HM_CONV: 2
+        SEPARATE_HEAD_CFG:
+            HEAD_ORDER: ['center', 'height', 'dim', 'rot', 'vel']
+            HEAD_DICT: {
+                'center': {'out_channels': 2, 'num_conv': 2},
+                'height': {'out_channels': 1, 'num_conv': 2},
+                'dim': {'out_channels': 3, 'num_conv': 2},
+                'rot': {'out_channels': 2, 'num_conv': 2},
+                'vel': {'out_channels': 2, 'num_conv': 2},
+            }
+
+        TARGET_ASSIGNER_CONFIG:
+            FEATURE_MAP_STRIDE: 8
+            DATASET: nuScenes
+            GAUSSIAN_OVERLAP: 0.1
+            MIN_RADIUS: 2
+            HUNGARIAN_ASSIGNER:
+                cls_cost: {'gamma': 2.0, 'alpha': 0.25, 'weight': 0.15}
+                reg_cost: {'weight': 0.25}
+                iou_cost: {'weight': 0.25}
+
+        LOSS_CONFIG:
+            LOSS_WEIGHTS: {
+                    'align_weight': 1.0,
+                    'cls_weight': 0.25,
+                    'bbox_weight': 0.25,
+                    'hm_weight': 1.0,
+                    'code_weights': [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2]
+                }
+            LOSS_SIZE_CLS:
+                use_sigmoid: True
+                gamma: 2.0
+                alpha: 0.25
+
+        POST_PROCESSING:
+            SCORE_THRESH: 0.0
+            POST_CENTER_RANGE: [-61.2, -61.2, -10.0, 61.2, 61.2, 10.0]
+
+    POST_PROCESSING:
+        RECALL_THRESH_LIST: [0.3, 0.5, 0.7]
+        SCORE_THRESH: 0.1
+        OUTPUT_RAW_SCORE: False
+        EVAL_METRIC: kitti
