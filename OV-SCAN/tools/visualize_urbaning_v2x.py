@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 import open3d
 import torch
+from PIL import Image, ImageDraw, ImageFont
 
 from pcdet.config import cfg, cfg_from_yaml_file
 from pcdet.datasets import build_dataloader
@@ -29,6 +30,9 @@ from pcdet.models import build_network, load_data_to_gpu
 from pcdet.ops.iou3d_nms import iou3d_nms_utils
 from pcdet.utils import common_utils
 from visual_utils.open3d_vis_utils import translate_boxes_to_open3d_instance
+
+# Bundled with matplotlib, present in the OV-SCAN image; falls back to PIL's bitmap font if not.
+_LABEL_FONT_PATH = '/opt/conda/lib/python3.10/site-packages/matplotlib/mpl-data/fonts/ttf/DejaVuSans-Bold.ttf'
 
 # index 0 unused (labels are 1-indexed); one color per CLASS_NAMES entry
 PRED_COLOR_MAP = [
@@ -59,6 +63,9 @@ def parse_config():
     parser.add_argument('--max_samples', type=int, default=None, help='limit number of samples (default: all)')
     parser.add_argument('--width', type=int, default=1280, help='render width in pixels')
     parser.add_argument('--height', type=int, default=960, help='render height in pixels')
+    parser.add_argument('--show_labels', action='store_true',
+                         help='overlay each box with a small class-id digit (same color as its wireframe) '
+                              'plus a legend mapping digit -> class name, for both GT and predicted boxes')
     args = parser.parse_args()
 
     cfg_from_yaml_file(args.cfg_file, cfg)
@@ -77,7 +84,74 @@ def add_boxes(vis, boxes, color, labels=None):
         vis.add_geometry(line_set, reset_bounding_box=False)
 
 
-def save_scene(points, gt_boxes, pred_boxes, pred_labels, save_path, width, height):
+def _class_color_255(label):
+    r, g, b = PRED_COLOR_MAP[int(label) % len(PRED_COLOR_MAP)]
+    return int(r * 255), int(g * 255), int(b * 255)
+
+
+def _project_point(point_xyz, intrinsic, extrinsic):
+    """World xyz -> (u, v) pixel coords, using the exact camera params the scene was rendered
+    with (pinhole projection, OpenCV/Open3D convention: extrinsic is world->camera, camera looks
+    down +Z). Returns None if the point is behind the camera."""
+    p_cam = extrinsic @ np.append(point_xyz, 1.0)
+    if p_cam[2] <= 1e-6:
+        return None
+    fx, fy, cx, cy = intrinsic[0, 0], intrinsic[1, 1], intrinsic[0, 2], intrinsic[1, 2]
+    return fx * p_cam[0] / p_cam[2] + cx, fy * p_cam[1] / p_cam[2] + cy
+
+
+def draw_box_labels(save_path, entries, class_names, intrinsic, extrinsic, width, height):
+    """Overlay a small class-id digit at each box's projected center, plus a legend. entries:
+    list of (center_xyz, label_id, is_gt). Digit color always matches the box's own wireframe
+    color (PRED_COLOR_MAP), so it reads consistently whether the box is GT or predicted; GT vs
+    predicted is still told apart by wireframe color (blue vs class-colored), noted in the legend.
+    """
+    img = Image.open(save_path).convert('RGB')
+    draw = ImageDraw.Draw(img, 'RGBA')
+    try:
+        font = ImageFont.truetype(_LABEL_FONT_PATH, 16)
+        legend_font = ImageFont.truetype(_LABEL_FONT_PATH, 14)
+    except OSError:
+        font = ImageFont.load_default()
+        legend_font = font
+
+    present_labels = set()
+    for center_xyz, label, _is_gt in entries:
+        uv = _project_point(center_xyz, intrinsic, extrinsic)
+        if uv is None:
+            continue
+        u, v = uv
+        if not (0 <= u < width and 0 <= v < height):
+            continue
+        text = str(int(label))
+        l, t, r, b = draw.textbbox((0, 0), text, font=font)
+        tw, th = r - l, b - t
+        pad = 3
+        draw.rectangle([u - tw / 2 - pad, v - th / 2 - pad, u + tw / 2 + pad, v + th / 2 + pad],
+                       fill=(0, 0, 0, 190))
+        draw.text((u - tw / 2 - l, v - th / 2 - t), text, fill=_class_color_255(label), font=font)
+        present_labels.add(int(label))
+
+    if present_labels:
+        rows = sorted(present_labels)
+        line_h = 18
+        legend_h = 10 + line_h * (len(rows) + 1)  # +1 for the GT-outline note
+        legend_w = 150
+        draw.rectangle([8, 8, 8 + legend_w, 8 + legend_h], fill=(0, 0, 0, 170))
+        for i, label in enumerate(rows):
+            y = 8 + 5 + i * line_h
+            name = class_names[label - 1] if 1 <= label <= len(class_names) else '?'
+            draw.text((14, y), str(label), fill=_class_color_255(label), font=legend_font)
+            draw.text((34, y), name, fill=(255, 255, 255), font=legend_font)
+        y = 8 + 5 + len(rows) * line_h
+        draw.text((14, y), 'GT', fill=tuple(int(c * 255) for c in GT_COLOR), font=legend_font)
+        draw.text((44, y), 'outline = ground truth', fill=(255, 255, 255), font=legend_font)
+
+    img.save(save_path)
+
+
+def save_scene(points, gt_boxes, pred_boxes, pred_labels, save_path, width, height,
+               show_labels=False, class_names=None):
     vis = open3d.visualization.Visualizer()
     vis.create_window(visible=False, width=width, height=height)
     vis.get_render_option().point_size = 1.5
@@ -100,13 +174,46 @@ def save_scene(points, gt_boxes, pred_boxes, pred_labels, save_path, width, heig
 
     vis.poll_events()
     vis.update_renderer()
+
+    cam_params = None
+    if show_labels:
+        cam = ctr.convert_to_pinhole_camera_parameters()
+        cam_params = (np.asarray(cam.intrinsic.intrinsic_matrix), np.asarray(cam.extrinsic))
+
     vis.capture_screen_image(str(save_path), do_render=True)
     vis.destroy_window()
+
+    if show_labels and cam_params is not None:
+        intrinsic, extrinsic = cam_params
+        entries = []
+        if gt_boxes is not None:
+            for box in gt_boxes:
+                entries.append((box[:3], box[-1], True))
+        if pred_boxes is not None:
+            for box, label in zip(pred_boxes, pred_labels):
+                entries.append((box[:3], label, False))
+        draw_box_labels(save_path, entries, class_names, intrinsic, extrinsic, width, height)
 
 
 def filter_valid_gt_boxes(gt_boxes_padded):
     valid = np.any(gt_boxes_padded[:, :6] != 0, axis=1)
     return gt_boxes_padded[valid]
+
+
+def filter_gt_boxes_in_range(gt_boxes, point_cloud_range):
+    """pcdet only strips out-of-range GT boxes when training=True (mask_points_and_boxes_outside_range
+    in data_processor.py checks `and self.training`); in eval/inference mode gt_boxes keeps every
+    labeled track for the whole scene, including objects far outside any sensor's actual range (e.g.
+    vehicles on approach roads well beyond the infra LiDARs' coverage of the intersection). Matching
+    against those inflates FN and deflates recall for something no input point cloud could ever
+    contain, so apply the same x/y range filter used on points before scoring/drawing GT.
+    """
+    if len(gt_boxes) == 0:
+        return gt_boxes
+    x_min, y_min, _, x_max, y_max, _ = point_cloud_range
+    in_range = (gt_boxes[:, 0] >= x_min) & (gt_boxes[:, 0] <= x_max) & \
+               (gt_boxes[:, 1] >= y_min) & (gt_boxes[:, 1] <= y_max)
+    return gt_boxes[in_range]
 
 
 def match_greedy(pred_boxes, pred_scores, gt_boxes, iou_thresh):
@@ -181,6 +288,7 @@ def main():
 
             points = data_dict['points'].cpu().numpy()[:, 1:]
             gt_boxes = filter_valid_gt_boxes(gt_boxes_padded) if gt_boxes_padded is not None else np.zeros((0, 7))
+            gt_boxes = filter_gt_boxes_in_range(gt_boxes, cfg.DATA_CONFIG.POINT_CLOUD_RANGE)
 
             tp, fp, fn = match_greedy(pred_boxes, pred_scores, gt_boxes, args.match_iou_thresh)
             total_tp += tp
@@ -190,7 +298,8 @@ def main():
                                      'num_preds': len(pred_boxes), 'num_gt': len(gt_boxes)})
 
             save_path = save_dir / f'{idx:04d}_{frame_id}.png'
-            save_scene(points, gt_boxes, pred_boxes, pred_labels, save_path, args.width, args.height)
+            save_scene(points, gt_boxes, pred_boxes, pred_labels, save_path, args.width, args.height,
+                       show_labels=args.show_labels, class_names=cfg.CLASS_NAMES)
 
             logger.info(f'[{idx + 1}/{num_samples}] saved {save_path.name} '
                         f'({len(pred_boxes)} preds >= {args.score_thresh}, {len(gt_boxes)} gt boxes, '
