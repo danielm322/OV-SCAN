@@ -273,8 +273,12 @@ class OVScanHead(nn.Module):
         for param in self.clip_img_encoder.parameters():
             param.requires_grad = False
         self.clip_img_encoder.eval().cuda()
-        # Get class names and create clip prompt templates
-        self.clip_prompt_template = str(self.model_cfg.ALIGNMENT.PROMPT)
+        # Get class names and create clip prompt templates. PROMPT may be a single string or a
+        # list of templates to ensemble (average the per-template text embeddings, then
+        # renormalize) -- a standard zero-shot CLIP accuracy trick, no retraining involved.
+        prompt_cfg = self.model_cfg.ALIGNMENT.PROMPT
+        self.clip_prompt_templates = [str(prompt_cfg)] if isinstance(prompt_cfg, str) else [str(p) for p in prompt_cfg]
+        self.clip_prompt_template = self.clip_prompt_templates[0]  # kept for the alignment-head text below
         self.nuscenes_to_ov_classes = self.model_cfg.ALIGNMENT.NUSCENES_TO_OV_CLASSES
         self.ov_classes = []
         for class_name in self.nuscenes_to_ov_classes.values():
@@ -282,12 +286,67 @@ class OVScanHead(nn.Module):
         self.ov_to_nuscenes_classes = {class_name: key for key, value in self.nuscenes_to_ov_classes.items() for class_name in value}
         self.nuscenes_to_label_id = {class_name: idx+1 for idx, class_name in enumerate(self.class_names)}
 
-        self.clip_texts = [self.clip_prompt_template.replace('CLASS', class_name) for class_name in self.ov_classes]
-        self.text_inputs = self.clip_tokenizer(self.clip_texts, context_length=self.clip_context_length)
         clip_model.eval().cuda()
+        num_templates = len(self.clip_prompt_templates)
+        all_texts = [tmpl.replace('CLASS', class_name)
+                     for tmpl in self.clip_prompt_templates for class_name in self.ov_classes]
+        self.text_inputs = self.clip_tokenizer(all_texts, context_length=self.clip_context_length)
         with torch.no_grad():
-            self.text_features = clip_model.encode_text(self.text_inputs.cuda()).detach()
-        self.text_features = self.text_features / self.text_features.norm(dim=-1, keepdim=True)
+            text_features = clip_model.encode_text(self.text_inputs.cuda()).detach()
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        text_features = text_features.view(num_templates, len(self.ov_classes), -1).mean(dim=0)
+        self.text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+        # --- Zero-shot inference-time fixes for cross-bucket CLIP relabeling noise ---
+        # CONSTRAIN_TO_HEATMAP_BUCKET + HEATMAP_BUCKET_TO_VOCAB_KEYS: restrict each proposal's
+        # CLIP argmax candidates to only the OV vocabulary strings reachable from its own
+        # heatmap-predicted coarse channel (top_proposals_class in predict()), per an explicit
+        # per-channel routing table -- NOT simply "same name" matching, because several heatmap
+        # channels legitimately route to a *different*-named vocab bucket (e.g. the 'bus'/
+        # 'trailer'/'motorcycle' channels feed the 'truck'/'bicycle' vocab buckets here), while
+        # channels with no entry in the table (e.g. 'barrier', 'traffic_cone', when the dataset
+        # has no such objects) are suppressed outright rather than left free to leak anywhere.
+        # Diagnosed empirically (see Urbaning_PHASE_1.md): ~32% of all raw proposals leak cross-bucket
+        # under unconstrained argmax, dominated by patterns like barrier/traffic_cone -> pedestrian
+        # and motorcycle -> pedestrian that directly pollute the sparse classes this table fixes.
+        self.constrain_ov_to_bucket = bool(self.model_cfg.ALIGNMENT.get('CONSTRAIN_TO_HEATMAP_BUCKET', False))
+        # MARGIN_THRESH: if set, when the top-1 vs runner-up CLIP logit margin within the
+        # (possibly bucket-constrained) candidate set is below this, fall back to a fixed default
+        # OV string for that bucket instead of trusting a low-confidence fine-grained pick.
+        self.ov_margin_thresh = self.model_cfg.ALIGNMENT.get('MARGIN_THRESH', None)
+        # RESCALE_BY_MARGIN_TEMPERATURE: if set, multiply each box's objectness score by
+        # sigmoid(margin / T) -- proposals CLIP is unsure about within its own bucket (e.g. noisy
+        # heatmap activations with no clear "this looks like a cyclist" signal) get down-weighted
+        # in the score used for ranking/AP, instead of competing on equal footing with confident
+        # detections. Unlike MARGIN_THRESH this doesn't change the predicted label, only its rank.
+        self.ov_rescale_temperature = self.model_cfg.ALIGNMENT.get('RESCALE_BY_MARGIN_TEMPERATURE', None)
+
+        ov_class_bucket_id = [self.nuscenes_to_label_id[self.ov_to_nuscenes_classes[c]] - 1 for c in self.ov_classes]
+        self.ov_class_bucket_id = torch.tensor(ov_class_bucket_id, dtype=torch.long).cuda()
+        # First-listed OV string per bucket = fallback/default for that bucket's margin gating.
+        self.bucket_default_ov_idx = {}
+        for idx, bucket_id in enumerate(ov_class_bucket_id):
+            self.bucket_default_ov_idx.setdefault(bucket_id, idx)
+
+        # heatmap_to_vocab_mask[h, k] = True iff a proposal whose heatmap channel is h (0-indexed
+        # into self.class_names) is allowed to be CLIP-labeled with ov_classes[k]. A heatmap
+        # channel absent from HEATMAP_BUCKET_TO_VOCAB_KEYS gets an all-False row -> every proposal
+        # from that channel is suppressed (score forced to 0 in decode_bbox) instead of being
+        # left to roam the full vocabulary. Defaults to "same-name bucket only" when the routing
+        # table isn't given, matching the plain same-bucket behavior for any channel that IS a
+        # vocab key.
+        routing_table = self.model_cfg.ALIGNMENT.get('HEATMAP_BUCKET_TO_VOCAB_KEYS', None)
+        if routing_table is None:
+            routing_table = {k: [k] for k in self.nuscenes_to_ov_classes.keys()}
+        heatmap_to_vocab_mask = torch.zeros(len(self.class_names), len(self.ov_classes), dtype=torch.bool)
+        for heatmap_channel, vocab_keys in routing_table.items():
+            h_idx = self.class_names.index(heatmap_channel)
+            allowed_ov_idx = [i for i, c in enumerate(self.ov_classes) if self.ov_to_nuscenes_classes[c] in vocab_keys]
+            heatmap_to_vocab_mask[h_idx, allowed_ov_idx] = True
+        self.heatmap_to_vocab_mask = heatmap_to_vocab_mask.cuda()
+        # Heatmap channels with literally no reachable vocab entry (e.g. barrier/traffic_cone
+        # when the dataset has none) -- their proposals get suppressed entirely, not relabeled.
+        self.suppressed_heatmap_channels = (heatmap_to_vocab_mask.sum(dim=-1) == 0).cuda()
 
         # For Alignment Head
         self.class_texts = [self.clip_prompt_template.replace('CLASS', class_name.replace('_', ' ')) for class_name in self.class_names]
@@ -401,11 +460,43 @@ class OVScanHead(nn.Module):
         res_layer["object_feats"] = query_cat_feat.permute(0, 2, 1)
 
         res_layer['clip_preds'] = self.alignment_head(global_query_feat, top_proposals_class)
-    
+
         clip_preds = res_layer['clip_preds'].detach()
         normalized_clip_preds = clip_preds / clip_preds.norm(dim=-1, keepdim=True)
-        res_layer["clip_logits"] = self.clip_logit_scale_exp * normalized_clip_preds @ self.text_features.t()
-        res_layer["ov_labels"] = torch.argmax(res_layer["clip_logits"], dim=-1)
+        clip_logits = self.clip_logit_scale_exp * normalized_clip_preds @ self.text_features.t()
+
+        if self.constrain_ov_to_bucket:
+            # (B, P, num_ov): per-proposal allowed OV strings, from this proposal's own heatmap
+            # channel's row of the routing table. Suppressed channels get an all-False row here;
+            # decode_bbox zeroes those proposals' scores using self.suppressed_heatmap_channels
+            # directly (their ov_labels/argmax below is meaningless and never surfaces).
+            allowed_mask = self.heatmap_to_vocab_mask[top_proposals_class]
+            safe_mask = torch.where(allowed_mask.any(dim=-1, keepdim=True), allowed_mask, torch.ones_like(allowed_mask))
+            clip_logits = clip_logits.masked_fill(~safe_mask, float('-inf'))
+
+        ov_labels = torch.argmax(clip_logits, dim=-1)
+
+        # Top1-vs-runner-up margin within the (possibly bucket-constrained) candidate set --
+        # used below for two independent, optional zero-shot heuristics: discrete fallback
+        # relabeling (MARGIN_THRESH) and continuous score rescaling (RESCALE_BY_MARGIN_TEMPERATURE).
+        if clip_logits.shape[-1] > 1:
+            top2_vals = torch.topk(clip_logits, k=2, dim=-1).values
+            ov_margin = top2_vals[..., 0] - top2_vals[..., 1]
+        else:
+            ov_margin = torch.full_like(ov_labels, float('inf'), dtype=clip_logits.dtype)
+
+        if self.ov_margin_thresh is not None:
+            low_margin = ov_margin < self.ov_margin_thresh
+            if low_margin.any():
+                default_idx = torch.zeros_like(ov_labels)
+                for bucket_id, ov_idx in self.bucket_default_ov_idx.items():
+                    default_idx = torch.where(top_proposals_class == bucket_id,
+                                               torch.full_like(default_idx, ov_idx), default_idx)
+                ov_labels = torch.where(low_margin, default_idx, ov_labels)
+
+        res_layer["clip_logits"] = clip_logits
+        res_layer["ov_labels"] = ov_labels
+        res_layer["ov_margin"] = ov_margin
         return res_layer
 
     def forward(self, batch_dict):
@@ -669,14 +760,25 @@ class OVScanHead(nn.Module):
             targets[:, 8:10] = bboxes[:, 7:]
         return targets
 
-    def decode_bbox(self, heatmap, rot, dim, center, height, vel, 
-                    object_feats, clip_preds, ov_labels, clip_logits, filter=False):
-        
+    def decode_bbox(self, heatmap, rot, dim, center, height, vel,
+                    object_feats, clip_preds, ov_labels, clip_logits, filter=False, query_labels=None,
+                    ov_margin=None):
+
         post_process_cfg = self.model_cfg.POST_PROCESSING
         score_thresh = post_process_cfg.SCORE_THRESH
         post_center_range = post_process_cfg.POST_CENTER_RANGE
         post_center_range = torch.tensor(post_center_range).cuda().float()
         final_scores = heatmap.max(1, keepdims=False).values
+
+        if self.constrain_ov_to_bucket and query_labels is not None:
+            # Proposals from a heatmap channel with no reachable OV vocab entry (per
+            # HEATMAP_BUCKET_TO_VOCAB_KEYS) are noise for our label space -- zero their score so
+            # they're dropped by the score_thresh filter below instead of surfacing under
+            # whatever vocab string unconstrained argmax happened to pick for them.
+            final_scores = final_scores.masked_fill(self.suppressed_heatmap_channels[query_labels], 0.0)
+
+        if self.ov_rescale_temperature is not None and ov_margin is not None:
+            final_scores = final_scores * torch.sigmoid(ov_margin / self.ov_rescale_temperature)
 
         center[:, 0, :] = center[:, 0, :] * self.feature_map_stride * self.voxel_size[0] + self.point_cloud_range[0]
         center[:, 1, :] = center[:, 1, :] * self.feature_map_stride * self.voxel_size[1] + self.point_cloud_range[1]
@@ -697,7 +799,7 @@ class OVScanHead(nn.Module):
             clip_pred = clip_preds[i]
             labels = ov_labels[i]
             logits = clip_logits[i]
-            
+
             predictions_dict = {
                 'pred_boxes': boxes3d,
                 'pred_scores': scores, # (box/ objectness score)
@@ -710,6 +812,10 @@ class OVScanHead(nn.Module):
             nusc_labels = [self.nuscenes_to_label_id[self.ov_to_nuscenes_classes[self.ov_classes[label]]] for label in predictions_dict['ov_labels']]
             predictions_dict["pred_labels"] = torch.tensor(nusc_labels).cuda()
             predictions_dict["ov_str_labels"] = [self.ov_classes[label] for label in predictions_dict['ov_labels']]
+            if query_labels is not None:
+                # Original heatmap-predicted coarse bucket (0-indexed), pre-CLIP-relabeling --
+                # diagnostic only, to measure cross-bucket CLIP "leakage".
+                predictions_dict["heatmap_bucket"] = query_labels[i]
             predictions_dicts.append(predictions_dict)
 
         if filter is False:
@@ -744,6 +850,8 @@ class OVScanHead(nn.Module):
             nusc_labels = [self.nuscenes_to_label_id[self.ov_to_nuscenes_classes[self.ov_classes[label]]] for label in predictions_dict['ov_labels']]
             predictions_dict["pred_labels"] = torch.tensor(nusc_labels).cuda()
             predictions_dict["ov_str_labels"] = [self.ov_classes[label] for label in predictions_dict['ov_labels']]
+            if query_labels is not None:
+                predictions_dict["heatmap_bucket"] = query_labels[i, cmask]
             predictions_dicts.append(predictions_dict)
 
         return predictions_dicts
@@ -774,6 +882,7 @@ class OVScanHead(nn.Module):
             batch_score, batch_rot, batch_dim, batch_center,
             batch_height, batch_vel, batch_object_feats,
             batch_clip_pred, batch_pred_labels, batch_clip_logits, filter=filter,
+            query_labels=preds_dicts['query_labels'], ov_margin=preds_dicts.get('ov_margin', None),
         )
 
         return ret_dict 
