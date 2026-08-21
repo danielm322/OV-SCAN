@@ -48,6 +48,7 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
+import mlflow
 import numpy as np
 import torch
 
@@ -56,6 +57,8 @@ from pcdet.datasets import build_dataloader
 from pcdet.models import build_network, load_data_to_gpu
 from pcdet.ops.iou3d_nms import iou3d_nms_utils
 from pcdet.utils import common_utils
+
+from mlflow_logging import add_common_args, get_or_create_run, run_name_for
 
 # Raw UrbanIng-V2X object_type string (as it appears in the labels json / native_categories.json
 # sidecar) -> canonical fine-class key.
@@ -91,6 +94,7 @@ def parse_config():
     parser.add_argument('--match_iou_thresh', type=float, default=0.25,
                          help='3D IoU threshold for greedy per-class pred<->GT matching')
     parser.add_argument('--max_samples', type=int, default=None, help='limit number of samples (default: all)')
+    add_common_args(parser)
     args = parser.parse_args()
 
     cfg_from_yaml_file(args.cfg_file, cfg)
@@ -197,6 +201,16 @@ def main():
     logger = common_utils.create_logger()
     logger.info('----------------- UrbanIng-V2X per-class AP/mAP -----------------')
 
+    run_name = run_name_for(args)
+    run = get_or_create_run(cfg.ROOT_DIR, args.mlflow_experiment, run_name, tags={
+        'fusion_type': args.fusion_type, 'sources': args.sources, 'reference': args.reference,
+    })
+    logger.info(f'MLflow run: {args.mlflow_experiment}/{run_name} ({run.info.run_id})')
+    mlflow.log_params({
+        'fusion_type': args.fusion_type, 'sources': args.sources, 'reference': args.reference,
+        'cfg_file': args.cfg_file, 'ckpt': args.ckpt, 'match_iou_thresh': args.match_iou_thresh,
+    })
+
     test_set, test_loader, _ = build_dataloader(
         dataset_cfg=cfg.DATA_CONFIG, class_names=cfg.CLASS_NAMES,
         batch_size=1, dist=False, workers=2, logger=logger, training=False
@@ -276,6 +290,16 @@ def main():
     with open(save_path, 'w') as f:
         json.dump(summary, f, indent=2)
 
+    mlflow_metrics = {'mAP_fine_classes': mAP_fine, 'mAP_groups': mAP_groups}
+    for cls, r in fine_results.items():
+        if r['num_gt'] > 0:
+            mlflow_metrics[f'ap_fine_{cls}'] = r['ap']
+    for grp, r in group_results.items():
+        if r['num_gt'] > 0:
+            mlflow_metrics[f'ap_group_{grp}'] = r['ap']
+    mlflow.log_metrics(mlflow_metrics)
+    mlflow.log_artifact(str(save_path))
+
     logger.info('=== Fine-grained native classes ===')
     for cls, r in fine_results.items():
         logger.info(f'{cls:>16s}: AP={r["ap"]:.3f}  num_gt={r["num_gt"]:5d}  num_pred={r["num_pred"]:5d}'
@@ -288,6 +312,7 @@ def main():
     logger.info(f'mAP (groups): {mAP_groups:.3f}')
     logger.info(f'Wrote {save_path}')
     logger.info('Done.')
+    mlflow.end_run()
 
 
 if __name__ == '__main__':

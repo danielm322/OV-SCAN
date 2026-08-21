@@ -44,6 +44,8 @@ logs/
 runs/
 wandb/
 lightning_logs/
+mlruns/
+mlflow.db*
 
 # Data
 /datasets/

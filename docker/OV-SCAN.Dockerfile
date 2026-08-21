@@ -104,6 +104,14 @@ RUN pip install \
     torchpack==0.3.1 wandb==0.18.0 tqdm transformers==4.50.0 \
     open_clip_torch==2.26.1 kaleido==0.2.1 pillow==10.4.0 tensorboardX==2.6.2.2
 
+# mlflow-skinny (tracking client only, no serving/evaluation extras) for the UrbanIng-V2X
+# experiment-tracking scripts. Installed in its own pip invocation, separate from the pinned
+# block above: mlflow needs numpy/protobuf newer than the pins above, and resolving both in one
+# `pip install` call would fail; a later, separate call is exactly what was validated live in the
+# running container (numpy 1.24.4->1.26.4, protobuf 4.25.3->6.33.6 -- confirmed no regression in
+# the pcdet/CUDA IoU ops or CLIP path, just unrelated wandb/tensorflow pip-check warnings).
+RUN pip install mlflow-skinny==3.15.1
+
 # ------------------------------------------------------------------------------
 # ICP-Flow Dependencies 
 # ------------------------------------------------------------------------------

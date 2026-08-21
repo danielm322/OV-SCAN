@@ -19,6 +19,7 @@ import argparse
 import json
 from pathlib import Path
 
+import mlflow
 import numpy as np
 import open3d
 import torch
@@ -30,6 +31,8 @@ from pcdet.models import build_network, load_data_to_gpu
 from pcdet.ops.iou3d_nms import iou3d_nms_utils
 from pcdet.utils import common_utils
 from visual_utils.open3d_vis_utils import translate_boxes_to_open3d_instance
+
+from mlflow_logging import add_common_args, get_or_create_run, run_name_for
 
 # Bundled with matplotlib, present in the OV-SCAN image; falls back to PIL's bitmap font if not.
 _LABEL_FONT_PATH = '/opt/conda/lib/python3.10/site-packages/matplotlib/mpl-data/fonts/ttf/DejaVuSans-Bold.ttf'
@@ -66,6 +69,9 @@ def parse_config():
     parser.add_argument('--show_labels', action='store_true',
                          help='overlay each box with a small class-id digit (same color as its wireframe) '
                               'plus a legend mapping digit -> class name, for both GT and predicted boxes')
+    parser.add_argument('--mlflow_max_artifacts', type=int, default=5,
+                         help='max sample visualization PNGs to upload as MLflow artifacts (0 disables)')
+    add_common_args(parser)
     args = parser.parse_args()
 
     cfg_from_yaml_file(args.cfg_file, cfg)
@@ -248,6 +254,17 @@ def main():
     logger = common_utils.create_logger()
     logger.info('----------------- UrbanIng-V2X visualization -----------------')
 
+    run_name = run_name_for(args)
+    run = get_or_create_run(cfg.ROOT_DIR, args.mlflow_experiment, run_name, tags={
+        'fusion_type': args.fusion_type, 'sources': args.sources, 'reference': args.reference,
+    })
+    logger.info(f'MLflow run: {args.mlflow_experiment}/{run_name} ({run.info.run_id})')
+    mlflow.log_params({
+        'fusion_type': args.fusion_type, 'sources': args.sources, 'reference': args.reference,
+        'cfg_file': args.cfg_file, 'ckpt': args.ckpt, 'score_thresh': args.score_thresh,
+        'match_iou_thresh': args.match_iou_thresh,
+    })
+
     test_set, test_loader, _ = build_dataloader(
         dataset_cfg=cfg.DATA_CONFIG, class_names=cfg.CLASS_NAMES,
         batch_size=1, dist=False, workers=2, logger=logger, training=False
@@ -268,6 +285,7 @@ def main():
 
     total_tp, total_fp, total_fn = 0, 0, 0
     per_frame_stats = []
+    sample_viz_paths = []
 
     with torch.no_grad():
         for idx, data_dict in enumerate(test_loader):
@@ -300,6 +318,8 @@ def main():
             save_path = save_dir / f'{idx:04d}_{frame_id}.png'
             save_scene(points, gt_boxes, pred_boxes, pred_labels, save_path, args.width, args.height,
                        show_labels=args.show_labels, class_names=cfg.CLASS_NAMES)
+            if len(sample_viz_paths) < args.mlflow_max_artifacts:
+                sample_viz_paths.append(save_path)
 
             logger.info(f'[{idx + 1}/{num_samples}] saved {save_path.name} '
                         f'({len(pred_boxes)} preds >= {args.score_thresh}, {len(gt_boxes)} gt boxes, '
@@ -324,10 +344,19 @@ def main():
     with open(summary_path, 'w') as f:
         json.dump(summary, f, indent=2)
 
+    mlflow.log_metrics({
+        'precision': precision, 'recall': recall,
+        'tp': total_tp, 'fp': total_fp, 'fn': total_fn,
+    })
+    mlflow.log_artifact(str(summary_path))
+    for p in sample_viz_paths:
+        mlflow.log_artifact(str(p), artifact_path='sample_visualizations')
+
     logger.info(f'Aggregate match@IoU{args.match_iou_thresh}: tp={total_tp} fp={total_fp} fn={total_fn} '
                 f'precision={precision:.3f} recall={recall:.3f}')
     logger.info(f'Wrote match summary to: {summary_path}')
     logger.info('Done.')
+    mlflow.end_run()
 
 
 if __name__ == '__main__':
