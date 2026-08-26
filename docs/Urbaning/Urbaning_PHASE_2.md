@@ -118,12 +118,15 @@ so the filelist entries need to be sensor-relative (`vehicle2_middle_lidar/<file
 
 **Setup:** backend store is a local SQLite database at `OV-SCAN/OV-SCAN/mlflow.db` (inside the docker
 bind-mounted subtree, so it persists across container recreation and is host-visible).
-`mlflow-skinny==3.15.1` added to `docker/OV-SCAN.Dockerfile` in its own `RUN pip install` step,
-separate from the pinned dependency block above it — mlflow needs newer `numpy`/`protobuf` than that
-block pins, and resolving both in one `pip install` call fails outright. Installed live in the
-running container first and smoke-tested (model forward pass, CUDA IoU ops, CLIP path) before
-touching the Dockerfile — no regression, just unrelated pip-check warnings against `wandb`/`tensorflow`
-(neither is used by these scripts).
+`mlflow==3.15.1` added to `docker/OV-SCAN.Dockerfile` in its own `RUN pip install` step, separate
+from the pinned dependency block above it — mlflow needs newer `numpy`/`protobuf` than that block
+pins, and resolving both in one `pip install` call fails outright. Installed live in the running
+container first and smoke-tested (model forward pass, CUDA IoU ops, CLIP path) before touching the
+Dockerfile — no regression, just unrelated pip-check warnings against `wandb`/`tensorflow` (neither
+is used by these scripts). (Originally installed as `mlflow-skinny` — tracking-client-only — but
+that turned out to be missing pieces needed later: `sqlalchemy`/`alembic` to open the SQLite
+backend store at all, then `Flask-CORS`/`gunicorn`/`uvicorn` to run `mlflow ui` itself. Switched to
+the full `mlflow` package once both gaps were hit live, documented in Phase 3.)
 
 **File store → SQLite migration:** the first pass of this pipeline used a plain filesystem backend
 (`mlruns/` + `MLFLOW_ALLOW_FILE_STORE=true`), which is enough for the Python client
@@ -195,5 +198,5 @@ per the original request to evaluate the same metrics as before.
 | `tools/visualize_urbaning_v2x.py` | same args + `--mlflow_max_artifacts`, metric/artifact logging |
 | `tools/cfgs/dataset_configs/urbaning_v2x_{v2v_v1ref,v2v_v2ref,v2i_vehicle1,v2i_vehicle2}_dataset.yaml` | new dataset configs |
 | `tools/cfgs/nuscenes_models/ov_scan_lidar_urbaning_{v2v_v1ref,v2v_v2ref,v2i_vehicle1,v2i_vehicle2}.yaml` | new model configs |
-| `docker/OV-SCAN.Dockerfile` | `mlflow-skinny==3.15.1` pip install |
+| `docker/OV-SCAN.Dockerfile` | `mlflow==3.15.1` pip install (see Phase 3: originally `mlflow-skinny`) |
 | `OV-SCAN/.gitignore` | `mlruns/`, `mlflow.db` |

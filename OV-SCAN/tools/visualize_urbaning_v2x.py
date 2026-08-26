@@ -32,7 +32,7 @@ from pcdet.ops.iou3d_nms import iou3d_nms_utils
 from pcdet.utils import common_utils
 from visual_utils.open3d_vis_utils import translate_boxes_to_open3d_instance
 
-from mlflow_logging import add_common_args, get_or_create_run, run_name_for
+from mlflow_logging import add_common_args, get_or_create_run, intersection_for, run_name_for
 
 # Bundled with matplotlib, present in the OV-SCAN image; falls back to PIL's bitmap font if not.
 _LABEL_FONT_PATH = '/opt/conda/lib/python3.10/site-packages/matplotlib/mpl-data/fonts/ttf/DejaVuSans-Bold.ttf'
@@ -71,10 +71,16 @@ def parse_config():
                               'plus a legend mapping digit -> class name, for both GT and predicted boxes')
     parser.add_argument('--mlflow_max_artifacts', type=int, default=5,
                          help='max sample visualization PNGs to upload as MLflow artifacts (0 disables)')
+    parser.add_argument('--data_path', type=str, default=None,
+                         help='override DATA_CONFIG.DATA_PATH from --cfg_file (lets one fixed set '
+                              'of 6 model configs be reused across many converted sequence '
+                              'datasets, instead of one dataset yaml per sequence)')
     add_common_args(parser)
     args = parser.parse_args()
 
     cfg_from_yaml_file(args.cfg_file, cfg)
+    if args.data_path is not None:
+        cfg.DATA_CONFIG.DATA_PATH = args.data_path
     cfg.TAG = Path(args.cfg_file).stem
     cfg.EXP_GROUP_PATH = '/'.join(args.cfg_file.split('/')[1:-1])
     return args, cfg
@@ -106,42 +112,78 @@ def _project_point(point_xyz, intrinsic, extrinsic):
     return fx * p_cam[0] / p_cam[2] + cx, fy * p_cam[1] / p_cam[2] + cy
 
 
+def _rects_overlap(a, b):
+    return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
+
+
+def _place_label(u, v, tw, th, pad, base_dy, placed_rects):
+    """Find a (cx, cy) center for a tw x th (+pad) label near (u, v + base_dy) that doesn't
+    overlap any rect already in placed_rects. Tries the preferred spot first (base_dy keeps GT
+    above / predictions below their box, so a matched pair -- which projects to nearly the same
+    point -- doesn't collide), then searches outward in expanding rings so labels from *different*
+    nearby boxes (e.g. two adjacent pedestrians) also separate instead of overlapping. Falls back
+    to the preferred spot if no free ring position exists within the search radius, rather than
+    drifting arbitrarily far from the box it labels."""
+    step = th + 2 * pad + 1
+    sign = 1 if base_dy >= 0 else -1
+    candidates = [(0, base_dy)]
+    for ring in range(1, 7):
+        d = ring * step
+        candidates += [(0, base_dy + sign * d), (d, base_dy), (-d, base_dy),
+                        (d, base_dy + sign * d), (-d, base_dy + sign * d)]
+    for dx, dy in candidates:
+        cx, cy = u + dx, v + dy
+        rect = (cx - tw / 2 - pad, cy - th / 2 - pad, cx + tw / 2 + pad, cy + th / 2 + pad)
+        if not any(_rects_overlap(rect, p) for p in placed_rects):
+            return cx, cy, rect
+    cx, cy = u, v + base_dy
+    return cx, cy, (cx - tw / 2 - pad, cy - th / 2 - pad, cx + tw / 2 + pad, cy + th / 2 + pad)
+
+
 def draw_box_labels(save_path, entries, class_names, intrinsic, extrinsic, width, height):
-    """Overlay a small class-id digit at each box's projected center, plus a legend. entries:
-    list of (center_xyz, label_id, is_gt). Digit color always matches the box's own wireframe
-    color (PRED_COLOR_MAP), so it reads consistently whether the box is GT or predicted; GT vs
-    predicted is still told apart by wireframe color (blue vs class-colored), noted in the legend.
+    """Overlay a small "P:<id>"/"G:<id>" label at each box's projected center, plus a legend.
+    entries: list of (center_xyz, label_id, is_gt). The P:/G: prefix makes GT vs. predicted
+    explicit on the label itself (in addition to the wireframe color distinction: blue for GT,
+    class-colored for predictions, both noted in the legend). A matched GT/prediction pair sits
+    at nearly the same projected point (that's what makes it a match), so GT labels default above
+    the box center and prediction labels below it; on top of that, _place_label pushes any label
+    further away from ones already drawn, so unrelated nearby boxes (e.g. two adjacent
+    pedestrians) don't collide either -- otherwise a later label just paints over an earlier one
+    and only one is ever visible.
     """
     img = Image.open(save_path).convert('RGB')
     draw = ImageDraw.Draw(img, 'RGBA')
     try:
-        font = ImageFont.truetype(_LABEL_FONT_PATH, 16)
-        legend_font = ImageFont.truetype(_LABEL_FONT_PATH, 14)
+        font = ImageFont.truetype(_LABEL_FONT_PATH, 10)
+        legend_font = ImageFont.truetype(_LABEL_FONT_PATH, 10)
     except OSError:
         font = ImageFont.load_default()
         legend_font = font
 
     present_labels = set()
-    for center_xyz, label, _is_gt in entries:
+    placed_rects = []
+    for center_xyz, label, is_gt in entries:
         uv = _project_point(center_xyz, intrinsic, extrinsic)
         if uv is None:
             continue
         u, v = uv
         if not (0 <= u < width and 0 <= v < height):
             continue
-        text = str(int(label))
+        text = f'{"G" if is_gt else "P"}:{int(label)}'
         l, t, r, b = draw.textbbox((0, 0), text, font=font)
         tw, th = r - l, b - t
-        pad = 3
-        draw.rectangle([u - tw / 2 - pad, v - th / 2 - pad, u + tw / 2 + pad, v + th / 2 + pad],
-                       fill=(0, 0, 0, 190))
-        draw.text((u - tw / 2 - l, v - th / 2 - t), text, fill=_class_color_255(label), font=font)
+        pad = 2
+        base_dy = -(th + 2 * pad + 1) if is_gt else (th + 2 * pad + 1)
+        cx, cy, rect = _place_label(u, v, tw, th, pad, base_dy, placed_rects)
+        placed_rects.append(rect)
+        draw.rectangle(rect, fill=(0, 0, 0, 190))
+        draw.text((cx - tw / 2 - l, cy - th / 2 - t), text, fill=_class_color_255(label), font=font)
         present_labels.add(int(label))
 
     if present_labels:
         rows = sorted(present_labels)
-        line_h = 18
-        legend_h = 10 + line_h * (len(rows) + 1)  # +1 for the GT-outline note
+        line_h = 15
+        legend_h = 10 + line_h * (len(rows) + 2)  # +2 for the P:/G: and outline notes
         legend_w = 150
         draw.rectangle([8, 8, 8 + legend_w, 8 + legend_h], fill=(0, 0, 0, 170))
         for i, label in enumerate(rows):
@@ -150,6 +192,9 @@ def draw_box_labels(save_path, entries, class_names, intrinsic, extrinsic, width
             draw.text((14, y), str(label), fill=_class_color_255(label), font=legend_font)
             draw.text((34, y), name, fill=(255, 255, 255), font=legend_font)
         y = 8 + 5 + len(rows) * line_h
+        draw.text((14, y), 'P: / G:', fill=(255, 255, 255), font=legend_font)
+        draw.text((72, y), 'prediction / ground truth', fill=(255, 255, 255), font=legend_font)
+        y += line_h
         draw.text((14, y), 'GT', fill=tuple(int(c * 255) for c in GT_COLOR), font=legend_font)
         draw.text((44, y), 'outline = ground truth', fill=(255, 255, 255), font=legend_font)
 
@@ -255,14 +300,19 @@ def main():
     logger.info('----------------- UrbanIng-V2X visualization -----------------')
 
     run_name = run_name_for(args)
+    intersection = intersection_for(args)
     run = get_or_create_run(cfg.ROOT_DIR, args.mlflow_experiment, run_name, tags={
         'fusion_type': args.fusion_type, 'sources': args.sources, 'reference': args.reference,
+        **({'sequence': args.sequence} if args.sequence else {}),
+        **({'intersection': intersection} if intersection else {}),
     })
     logger.info(f'MLflow run: {args.mlflow_experiment}/{run_name} ({run.info.run_id})')
     mlflow.log_params({
         'fusion_type': args.fusion_type, 'sources': args.sources, 'reference': args.reference,
         'cfg_file': args.cfg_file, 'ckpt': args.ckpt, 'score_thresh': args.score_thresh,
         'match_iou_thresh': args.match_iou_thresh,
+        **({'sequence': args.sequence} if args.sequence else {}),
+        **({'intersection': intersection} if intersection else {}),
     })
 
     test_set, test_loader, _ = build_dataloader(

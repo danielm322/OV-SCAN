@@ -22,12 +22,16 @@ with data_dict['gt_boxes'] is guaranteed because:
   - pcdet's info-pkl builder (nuscenes_utils.fill_trainval_infos) keeps only annotations with
     num_lidar_pts + num_radar_pts > 0, preserving order; the converter mirrors that exact
     condition when appending to the sidecar.
-  - at eval time (training=False), pcdet applies no further GT reordering/removal (verified: the
-    outside-range box removal in mask_points_and_boxes_outside_range only fires when
-    self.training=True, and FILTER_MIN_POINTS_IN_GT re-applies the same already-satisfied
-    condition).
-Empirically verified against both converted datasets: for all 200 samples in each, len(sidecar
-list) == len(info['gt_boxes']), with matching per-box coarse category.
+  - at eval time (training=False), the outside-range box removal in
+    mask_points_and_boxes_outside_range only fires when self.training=True, and
+    FILTER_MIN_POINTS_IN_GT re-applies the same already-satisfied condition -- neither drops
+    anything here.
+  - pcdet's dataset __getitem__ DOES unconditionally drop any GT box whose class name isn't in
+    CLASS_NAMES, regardless of train/eval mode (e.g. UrbanIng-V2X's 'ignore' native category, used
+    for ambiguous/uncertain objects, has no CLASS_NAMES entry). This full-dataset sweep surfaced a
+    sequence containing one -- filter_valid_gt_boxes_with_categories re-derives the same drop from
+    each frame's own info['gt_names'] before comparing lengths, so alignment holds regardless of
+    which native categories a given sequence happens to contain.
 
 Per-class matching: for each class of interest (an UrbanIng-V2X native category, or one of the
 paper's 4 label groups -- vehicle={Car,Van}, two_wheelers={Cyclist,Motorcycle,EScooter},
@@ -58,7 +62,7 @@ from pcdet.models import build_network, load_data_to_gpu
 from pcdet.ops.iou3d_nms import iou3d_nms_utils
 from pcdet.utils import common_utils
 
-from mlflow_logging import add_common_args, get_or_create_run, run_name_for
+from mlflow_logging import add_common_args, get_or_create_run, intersection_for, run_name_for
 
 # Raw UrbanIng-V2X object_type string (as it appears in the labels json / native_categories.json
 # sidecar) -> canonical fine-class key.
@@ -94,20 +98,38 @@ def parse_config():
     parser.add_argument('--match_iou_thresh', type=float, default=0.25,
                          help='3D IoU threshold for greedy per-class pred<->GT matching')
     parser.add_argument('--max_samples', type=int, default=None, help='limit number of samples (default: all)')
+    parser.add_argument('--data_path', type=str, default=None,
+                         help='override DATA_CONFIG.DATA_PATH from --cfg_file (lets one fixed set '
+                              'of 6 model configs be reused across many converted sequence '
+                              'datasets, instead of one dataset yaml per sequence)')
     add_common_args(parser)
     args = parser.parse_args()
 
     cfg_from_yaml_file(args.cfg_file, cfg)
+    if args.data_path is not None:
+        cfg.DATA_CONFIG.DATA_PATH = args.data_path
     cfg.TAG = Path(args.cfg_file).stem
     cfg.EXP_GROUP_PATH = '/'.join(args.cfg_file.split('/')[1:-1])
     return args, cfg
 
 
-def filter_valid_gt_boxes_with_categories(gt_boxes_padded, native_categories):
+def filter_valid_gt_boxes_with_categories(gt_boxes_padded, native_categories, gt_names, class_names):
+    """pcdet's dataset __getitem__ silently drops any GT box whose class name isn't in
+    CLASS_NAMES -- e.g. UrbanIng-V2X uses an 'ignore' native category for ambiguous/uncertain
+    objects, which has no CLASS_NAMES entry. This happens unconditionally (unlike the
+    outside-range box removal, which is train-only), so it can desync gt_boxes_padded from the
+    native_categories sidecar (written 1:1 against the *unfiltered* per-frame object list) the
+    moment any frame contains such a box -- rare enough that the single reference sequence this
+    alignment was first verified against never happened to contain one. Re-derive the same
+    class-name drop here, from each frame's own info['gt_names'], so the two stay aligned
+    regardless of which categories a given sequence happens to contain.
+    """
+    class_mask = np.array([n in class_names for n in gt_names], dtype=bool)
+    kept_categories = [c for c, keep in zip(native_categories, class_mask) if keep]
     valid = np.any(gt_boxes_padded[:, :6] != 0, axis=1)
-    assert valid.sum() == len(native_categories), \
-        f'gt_boxes/native_categories length mismatch: {valid.sum()} vs {len(native_categories)}'
-    return gt_boxes_padded[valid], native_categories
+    assert valid.sum() == len(kept_categories), \
+        f'gt_boxes/native_categories length mismatch: {valid.sum()} vs {len(kept_categories)}'
+    return gt_boxes_padded[valid], kept_categories
 
 
 def filter_in_range_with_categories(gt_boxes, native_categories, point_cloud_range):
@@ -202,13 +224,18 @@ def main():
     logger.info('----------------- UrbanIng-V2X per-class AP/mAP -----------------')
 
     run_name = run_name_for(args)
+    intersection = intersection_for(args)
     run = get_or_create_run(cfg.ROOT_DIR, args.mlflow_experiment, run_name, tags={
         'fusion_type': args.fusion_type, 'sources': args.sources, 'reference': args.reference,
+        **({'sequence': args.sequence} if args.sequence else {}),
+        **({'intersection': intersection} if intersection else {}),
     })
     logger.info(f'MLflow run: {args.mlflow_experiment}/{run_name} ({run.info.run_id})')
     mlflow.log_params({
         'fusion_type': args.fusion_type, 'sources': args.sources, 'reference': args.reference,
         'cfg_file': args.cfg_file, 'ckpt': args.ckpt, 'match_iou_thresh': args.match_iou_thresh,
+        **({'sequence': args.sequence} if args.sequence else {}),
+        **({'intersection': intersection} if intersection else {}),
     })
 
     test_set, test_loader, _ = build_dataloader(
@@ -248,7 +275,9 @@ def main():
             pred_native = [PRED_NATIVE_TO_CANONICAL.get(s) for s in pred['ov_str_labels']]
 
             native_categories = native_categories_by_sample.get(sample_token, [])
-            gt_boxes, gt_native_raw = filter_valid_gt_boxes_with_categories(gt_boxes_padded, native_categories)
+            gt_names = test_set.infos[idx]['gt_names']
+            gt_boxes, gt_native_raw = filter_valid_gt_boxes_with_categories(
+                gt_boxes_padded, native_categories, gt_names, cfg.CLASS_NAMES)
             gt_boxes, gt_native_raw = filter_in_range_with_categories(
                 gt_boxes, gt_native_raw, cfg.DATA_CONFIG.POINT_CLOUD_RANGE)
             gt_native = [GT_NATIVE_TO_CANONICAL.get(c) for c in gt_native_raw]

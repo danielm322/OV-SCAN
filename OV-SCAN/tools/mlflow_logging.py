@@ -12,6 +12,7 @@ experiment: the eval and visualize scripts are separate process invocations, but
 visualizations for one experiment all land in one comparable row.
 Browse with: mlflow ui --backend-store-uri sqlite:////OV-SCAN/OV-SCAN/mlflow.db -h 0.0.0.0
 """
+import re
 from pathlib import Path
 
 import mlflow
@@ -28,17 +29,36 @@ def add_common_args(parser):
                          choices=['vehicle1', 'vehicle2', 'none'],
                          help='reference/ego vehicle whose frame the fused cloud is expressed in '
                               '("none" for i2i, which uses a recentered global frame instead)')
+    parser.add_argument('--sequence', type=str, default=None,
+                         help='UrbanIng-V2X sequence name (e.g. "20241126_0001_crossing2_00"); '
+                              'folded into the run name so multiple sequences of the same '
+                              'fusion_type/sources stay distinguishable, and logged as a param/tag '
+                              'for filtering. Omit for single-sequence, non-batch runs.')
+    parser.add_argument('--intersection', type=str, default=None,
+                         help='intersection id (e.g. "crossing1"); auto-derived from --sequence '
+                              'if not given')
     parser.add_argument('--mlflow_experiment', type=str, default='urbaning_v2x',
                          help='MLflow experiment name')
     parser.add_argument('--run_name', type=str, default=None,
-                         help='MLflow run name (default: "<fusion_type>__<sources>")')
+                         help='MLflow run name (default: "<fusion_type>__<sources>[__<sequence>]")')
+
+
+def intersection_for(args):
+    if args.intersection:
+        return args.intersection
+    if args.sequence:
+        m = re.search(r'crossing\d+', args.sequence)
+        if m:
+            return m.group(0)
+    return None
 
 
 def run_name_for(args):
     if args.run_name:
         return args.run_name
     slug = args.sources.replace('+', '_').replace(',', '-')
-    return f'{args.fusion_type}__{slug}'
+    base = f'{args.fusion_type}__{slug}'
+    return f'{base}__{args.sequence}' if args.sequence else base
 
 
 def get_or_create_run(root_dir, experiment_name, run_name, tags):
