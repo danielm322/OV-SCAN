@@ -104,6 +104,20 @@ RUN pip install \
     torchpack==0.3.1 wandb==0.18.0 tqdm transformers==4.50.0 \
     open_clip_torch==2.26.1 kaleido==0.2.1 pillow==10.4.0 tensorboardX==2.6.2.2
 
+# mlflow for the UrbanIng-V2X experiment-tracking scripts. Installed in its own pip invocation,
+# separate from the pinned block above: mlflow needs numpy/protobuf newer than the pins above, and
+# resolving both in one `pip install` call would fail; a later, separate call is exactly what was
+# validated live in the running container (numpy 1.24.4->1.26.4, protobuf 4.25.3->6.33.6 --
+# confirmed no regression in the pcdet/CUDA IoU ops or CLIP path, just unrelated
+# wandb/tensorflow pip-check warnings).
+# Full `mlflow`, not `mlflow-skinny`: skinny is tracking-client-only and is missing both (a)
+# sqlalchemy/alembic, needed just to OPEN the SQLite backend store (OV-SCAN/mlflow.db) from the
+# tracking scripts -- without them any sqlite:/// tracking URI fails with "Model registry
+# functionality is unavailable" at import time -- and (b) Flask-CORS/gunicorn/uvicorn, needed to
+# actually RUN `mlflow ui`/`mlflow server` to browse results, which skinny errors out on
+# (ModuleNotFoundError: flask_cors). Both gaps were hit live; full `mlflow` bundles everything.
+RUN pip install mlflow==3.15.1
+
 # ------------------------------------------------------------------------------
 # ICP-Flow Dependencies 
 # ------------------------------------------------------------------------------

@@ -1,0 +1,4 @@
+datasets/
+pretrained/
+docker/.bash_history
+*.so
