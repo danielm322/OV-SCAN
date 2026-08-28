@@ -181,8 +181,8 @@ wrong place, it just doesn't fire often enough to recall everything labeled.
 |---|---|
 | `tools/urbaning_v2x/run_full_dataset_eval.py` | host-side orchestrator: extract → convert → eval (+ viz for 3 scenes) → delete, resumable |
 | `tools/urbaning_v2x/build_infos.py` | standalone info-pkl builder, `--data_path` driven (no per-sequence yaml needed) |
-| `tools/urbaning_v2x/aggregate_full_dataset_results.py` | pulls per-intersection × per-config mAP mean/std from MLflow |
-| `tools/eval_urbaning_v2x_per_class.py` | `--data_path` override; `--sequence`/`--intersection` passthrough; GT/category alignment fix (§2) |
+| `tools/urbaning_v2x/aggregate_full_dataset_results.py` | pulls per-intersection × per-config mAP mean/std from MLflow, one table per IoU threshold (§10) |
+| `tools/eval_urbaning_v2x_per_class.py` | `--data_path` override; `--sequence`/`--intersection` passthrough; GT/category alignment fix (§2); `--extra_match_iou_threshs` IoU sweep from one inference pass (§10) |
 | `tools/visualize_urbaning_v2x.py` | `--data_path` override; `--sequence`/`--intersection` passthrough |
 | `tools/mlflow_logging.py` | `--sequence`/`--intersection` args; `run_name` now includes sequence |
 
@@ -284,3 +284,119 @@ but not implemented — it's compute-neutral and avoids the retraining problem a
 real redesign of the converter's reference-frame logic (the current `ego_pose`/`calibrated_sensor`
 semantics assume the window's origin is a real vehicle's own sensor frame) and would only partially
 help v2i, since infra sensors can sit 100m+ away even from a recentered midpoint.
+
+---
+
+## 9. Score threshold: investigated and ruled out (2026-08-28)
+
+Raised concern: does §3's mAP depend on the model's score threshold (0.1 in every config's
+`MODEL.POST_PROCESSING.SCORE_THRESH`) — specifically, would lowering it to 0.05 change the results?
+
+**Short answer: no.** `class_ap` (the AP methodology behind every mAP number in this doc, and in
+Phase 4's late-fusion work) sweeps every raw proposal the model emits and is rank-based by
+construction — no score cutoff is ever applied before ranking, so a "score threshold" in the usual
+sense can't move it. But the codebase turns out to have *two* same-named config fields that could
+plausibly matter, so this was worth actually checking rather than asserting from that argument
+alone:
+
+- `MODEL.POST_PROCESSING.SCORE_THRESH` (0.1, the one every model config sets) — read only by
+  `OVScanLidar.post_processing()`, which in fact never references it (only `RECALL_THRESH_LIST` is
+  used there).
+- `MODEL.DENSE_HEAD.POST_PROCESSING.SCORE_THRESH` (0.0) — this one *is* read, inside
+  `OVScanHead.decode_bbox()`, but the eval-time call path (`forward()` → `get_bboxes()` →
+  `decode_bbox(..., filter=True)`) always resolves to this fixed head-local 0.0, independent of the
+  top-level value above.
+
+**A false start, and how it was caught.** A first quick test (edit the top-level 0.1 → 0.05 in a
+scratch copy of the config, re-run one sequence) produced what looked like a real, reproducible
+split — bus AP shifted from 0.643 to 0.662, bit-identical within 2 reps at each value. That's what
+a genuine effect would look like, and it was wrong: a temporary debug `print` patched into
+`decode_bbox` confirmed the threshold it actually uses stays a constant `0.0` regardless of which
+config file was passed. Re-running each value **4** times (8 runs total, same sequence/config
+otherwise) instead of 2 made the apparent split evaporate — bus AP came back bit-identical across
+all 8 runs, and mAP jitter dropped to the same ~0.0004-scale GPU non-determinism already documented
+in Phase 2–4. The 2-rep test had, by chance, sampled two nondeterministic realizations that happened
+to cluster by threshold value; it wasn't measuring the threshold at all. **Lesson: this codebase's
+GPU-nondeterminism jitter is large enough that a 2-sample A/B test can produce a fully reproducible-
+looking but spurious split — anything claiming a small (<1%) effect needs ≥4 reps per arm before
+being trusted.**
+
+**Conclusion:** §3/§10's mAP tables are unaffected by score threshold; no re-run was needed on that
+axis. (Diagnostic debug print and scratch config files were reverted/deleted after the test; a
+throwaway `score_thresh_sanity_check_tmp` MLflow experiment used for these runs was deleted too.)
+
+## 10. IoU=0.3 / IoU=0.5 sweep: the full dataset re-run (2026-08-28)
+
+Unlike score threshold, the matching IoU threshold (`--match_iou_thresh`, 0.25 throughout §3) *does*
+directly gate `class_ap`'s pred↔GT matching — every one of §3's numbers was IoU=0.25 only. This
+needed an actual re-run, since raw per-frame predictions weren't cached to disk (only the final AP
+summary was) — there's no way to recompute at a new IoU threshold without re-running inference.
+
+**Implementation, to avoid 3x the compute:** `eval_urbaning_v2x_per_class.py` gained
+`--extra_match_iou_threshs` (default `'0.3,0.5'`) — it computes AP at the primary threshold (0.25,
+keeping the original unsuffixed metric names for continuity) *and* every extra threshold from the
+**same** inference pass per (sequence, variant); only the cheap AP-matching math re-runs per extra
+threshold, not the forward pass. Extra-threshold metrics are logged with a `_iou<T>` suffix (e.g.
+`mAP_fine_classes_iou0.3`) into the existing MLflow run for that (sequence, variant) — same
+`run_name`/`run_id` as the original §3 run, enriched in place rather than creating new runs or a new
+experiment. Verified with a single-sequence dry run before committing to the full sweep: exactly one
+run per name, both `mAP_fine_classes` (0.25, matching the original value within noise) and the new
+`_iou0.3`/`_iou0.5` metrics present. `aggregate_full_dataset_results.py` was extended to print one
+table per IoU threshold instead of just 0.25.
+
+**Re-running the full sweep:** all 31 non-viz-scene sequences' data had already been deleted after
+§1's original sweep (by design, for disk space), so re-computing at any new threshold meant
+re-running the *entire* extract→convert→infer pipeline for all 34 sequences × 6 configs again — same
+cost as the original §1 sweep, ~5.2 hours wall clock this time (10:25→15:39 CEST). The 3 designated
+viz-scene sequences kept their converted data from §1, so only needed their (cheap) eval markers
+cleared to force re-inference through the same already-converted data. **0 failures across all 204
+(sequence, variant) eval runs.**
+
+### Results: mAP by IoU threshold (mean ± std across sequences per intersection × config)
+
+| Intersection | Fusion | Reference | N | mAP fine (IoU .25 / .3 / .5) | mAP groups (IoU .25 / .3 / .5) |
+|---|---|---|---|---|---|
+| crossing1 | i2i | none | 17 | 0.309 / 0.266 / 0.102 | 0.361 / 0.296 / 0.082 |
+| crossing1 | single_vehicle | vehicle1 | 17 | 0.368 / 0.339 / 0.160 | 0.466 / 0.428 / 0.171 |
+| crossing1 | v2i | vehicle1 | 17 | **0.395 / 0.370 / 0.214** | **0.490 / 0.458 / 0.239** |
+| crossing1 | v2i | vehicle2 | 17 | 0.366 / 0.335 / 0.181 | 0.483 / 0.438 / 0.201 |
+| crossing1 | v2v | vehicle1 | 17 | 0.391 / 0.367 / 0.200 | 0.469 / 0.435 / 0.201 |
+| crossing1 | v2v | vehicle2 | 17 | 0.379 / 0.348 / 0.187 | 0.490 / 0.448 / 0.208 |
+| crossing2 | i2i | none | 10 | 0.257 / 0.217 / 0.076 | 0.287 / 0.235 / 0.054 |
+| crossing2 | single_vehicle | vehicle1 | 10 | 0.300 / 0.269 / 0.122 | 0.389 / 0.344 / 0.137 |
+| crossing2 | v2i | vehicle1 | 10 | 0.280 / 0.257 / 0.132 | 0.388 / 0.353 / 0.164 |
+| crossing2 | v2i | vehicle2 | 10 | 0.328 / 0.303 / 0.175 | 0.425 / 0.388 / 0.203 |
+| crossing2 | v2v | vehicle1 | 10 | 0.295 / 0.272 / 0.137 | 0.404 / 0.366 / 0.173 |
+| crossing2 | v2v | vehicle2 | 10 | **0.335 / 0.310 / 0.160** | **0.450 / 0.412 / 0.193** |
+| crossing3 | i2i | none | 7 | 0.203 / 0.174 / 0.067 | 0.296 / 0.245 / 0.078 |
+| crossing3 | single_vehicle | vehicle1 | 7 | **0.380 / 0.364 / 0.188** | **0.465 / 0.441 / 0.206** |
+| crossing3 | v2i | vehicle1 | 7 | 0.347 / 0.326 / 0.190 | 0.427 / 0.400 / 0.220 |
+| crossing3 | v2i | vehicle2 | 7 | 0.320 / 0.300 / 0.185 | 0.385 / 0.360 / 0.203 |
+| crossing3 | v2v | vehicle1 | 7 | 0.360 / 0.340 / 0.197 | 0.422 / 0.395 / 0.207 |
+| crossing3 | v2v | vehicle2 | 7 | 0.340 / 0.317 / 0.184 | 0.389 / 0.359 / 0.194 |
+
+(IoU=0.25 column re-derived from this session's re-run, not copied from §3 — values match §3's
+original numbers within the same ~0.001–0.005 GPU-nondeterminism band documented in §9, confirming
+the re-run reproduces the original pipeline faithfully.)
+
+**Findings:**
+- **mAP degrades sharply and consistently with stricter IoU across every config and intersection** —
+  fine-class mAP typically loses 60–75% of its IoU=0.25 value by IoU=0.5 (e.g. crossing2 i2i:
+  0.257→0.076, a 70% relative drop; crossing1 v2i_vehicle1: 0.395→0.214, "only" 46% relative,
+  the best-preserved config at IoU=0.5 in every intersection). This says the pretrained TransFusion
+  head's box *localization* (not just classification) is comparatively loose relative to nuScenes'
+  own typical IoU regimes — consistent with a zero-shot checkpoint operating outside its native
+  training distribution's geometry statistics, on top of the taxonomy-transfer gap already discussed
+  in Phase 2.
+- **The qualitative ranking across configs is IoU-stable.** i2i remains the weakest config at every
+  intersection and every IoU threshold; the best config at each intersection (bolded) stays the same
+  best config across all 3 thresholds too. This means §3's comparative conclusions ("fusion beats
+  single_vehicle", "i2i is weakest") are not artifacts of the specific IoU=0.25 choice — they hold at
+  stricter matching too, just at uniformly lower absolute mAP.
+- **v2i_vehicle1 (crossing1) and v2v_vehicle2 (crossing2) hold up best under IoU=0.5** relative to
+  their own IoU=0.25 value — worth a closer look if future work prioritizes localization tightness,
+  not just classification-level detection.
+- **Practical implication for any future benchmark comparison against this checkpoint**: report the
+  matching IoU threshold explicitly — at IoU=0.5 (a common detection-benchmark default) every
+  number here reads roughly 3–5x lower than at IoU=0.25, which is easy to mistake for a much weaker
+  model if the threshold isn't stated.

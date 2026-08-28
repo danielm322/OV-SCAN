@@ -96,7 +96,13 @@ def parse_config():
     parser.add_argument('--save_path', type=str, default=None,
                          help='output json path (default: output/<exp>/<tag>/default/per_class_ap.json)')
     parser.add_argument('--match_iou_thresh', type=float, default=0.25,
-                         help='3D IoU threshold for greedy per-class pred<->GT matching')
+                         help='primary 3D IoU threshold for greedy per-class pred<->GT matching -- '
+                              'metrics at this threshold keep the original unsuffixed names '
+                              '(mAP_fine_classes, ap_fine_<cls>, ...) for continuity with prior runs')
+    parser.add_argument('--extra_match_iou_threshs', type=str, default='0.3,0.5',
+                         help='comma-separated additional IoU thresholds, swept from the same '
+                              'inference pass (no extra forward passes) -- logged/saved with a '
+                              '"_iou<thresh>" suffix. Empty string to disable.')
     parser.add_argument('--max_samples', type=int, default=None, help='limit number of samples (default: all)')
     parser.add_argument('--data_path', type=str, default=None,
                          help='override DATA_CONFIG.DATA_PATH from --cfg_file (lets one fixed set '
@@ -234,6 +240,7 @@ def main():
     mlflow.log_params({
         'fusion_type': args.fusion_type, 'sources': args.sources, 'reference': args.reference,
         'cfg_file': args.cfg_file, 'ckpt': args.ckpt, 'match_iou_thresh': args.match_iou_thresh,
+        'extra_match_iou_threshs': args.extra_match_iou_threshs,
         **({'sequence': args.sequence} if args.sequence else {}),
         **({'intersection': intersection} if intersection else {}),
     })
@@ -288,20 +295,21 @@ def main():
             })
             logger.info(f'[{idx + 1}/{num_samples}] {len(pred_boxes)} raw preds, {len(gt_boxes)} gt boxes in range')
 
-    logger.info('Computing per-class AP...')
-    fine_results = {}
-    for cls in FINE_CLASSES:
-        fine_results[cls] = class_ap(frames, cls, args.match_iou_thresh, class_of=lambda c: c)
+    def compute_ap_at(iou_thresh):
+        fine = {cls: class_ap(frames, cls, iou_thresh, class_of=lambda c: c) for cls in FINE_CLASSES}
+        canonical_to_group = lambda c: CANONICAL_TO_GROUP.get(c)
+        group = {grp: class_ap(frames, grp, iou_thresh, class_of=canonical_to_group) for grp in GROUPS}
+        valid_fine_aps = [r['ap'] for r in fine.values() if r['num_gt'] > 0]
+        valid_group_aps = [r['ap'] for r in group.values() if r['num_gt'] > 0]
+        mAP_fine = float(np.mean(valid_fine_aps)) if valid_fine_aps else float('nan')
+        mAP_groups = float(np.mean(valid_group_aps)) if valid_group_aps else float('nan')
+        return fine, group, mAP_fine, mAP_groups
 
-    group_results = {}
-    canonical_to_group = lambda c: CANONICAL_TO_GROUP.get(c)
-    for grp in GROUPS:
-        group_results[grp] = class_ap(frames, grp, args.match_iou_thresh, class_of=canonical_to_group)
+    extra_threshs = [float(x) for x in args.extra_match_iou_threshs.split(',') if x.strip()]
 
-    valid_fine_aps = [r['ap'] for r in fine_results.values() if r['num_gt'] > 0]
-    valid_group_aps = [r['ap'] for r in group_results.values() if r['num_gt'] > 0]
-    mAP_fine = float(np.mean(valid_fine_aps)) if valid_fine_aps else float('nan')
-    mAP_groups = float(np.mean(valid_group_aps)) if valid_group_aps else float('nan')
+    logger.info(f'Computing per-class AP at IoU={args.match_iou_thresh} (primary)'
+                + (f' and IoU={extra_threshs} (extra)' if extra_threshs else '') + '...')
+    fine_results, group_results, mAP_fine, mAP_groups = compute_ap_at(args.match_iou_thresh)
 
     summary = {
         'cfg_file': args.cfg_file,
@@ -311,13 +319,8 @@ def main():
         'groups': group_results,
         'mAP_fine_classes': mAP_fine,
         'mAP_groups': mAP_groups,
+        'by_iou_thresh': {},
     }
-
-    save_path = Path(args.save_path) if args.save_path is not None else \
-        cfg.ROOT_DIR / 'output' / cfg.EXP_GROUP_PATH / cfg.TAG / 'default' / 'per_class_ap.json'
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(save_path, 'w') as f:
-        json.dump(summary, f, indent=2)
 
     mlflow_metrics = {'mAP_fine_classes': mAP_fine, 'mAP_groups': mAP_groups}
     for cls, r in fine_results.items():
@@ -326,8 +329,6 @@ def main():
     for grp, r in group_results.items():
         if r['num_gt'] > 0:
             mlflow_metrics[f'ap_group_{grp}'] = r['ap']
-    mlflow.log_metrics(mlflow_metrics)
-    mlflow.log_artifact(str(save_path))
 
     logger.info('=== Fine-grained native classes ===')
     for cls, r in fine_results.items():
@@ -339,6 +340,32 @@ def main():
         logger.info(f'{grp:>16s}: AP={r["ap"]:.3f}  num_gt={r["num_gt"]:5d}  num_pred={r["num_pred"]:5d}'
                     if r['num_gt'] > 0 else f'{grp:>16s}: no GT in this run')
     logger.info(f'mAP (groups): {mAP_groups:.3f}')
+
+    for iou_thresh in extra_threshs:
+        fine_x, group_x, mAP_fine_x, mAP_groups_x = compute_ap_at(iou_thresh)
+        suffix = f'_iou{iou_thresh}'
+        summary['by_iou_thresh'][str(iou_thresh)] = {
+            'fine_classes': fine_x, 'groups': group_x,
+            'mAP_fine_classes': mAP_fine_x, 'mAP_groups': mAP_groups_x,
+        }
+        mlflow_metrics[f'mAP_fine_classes{suffix}'] = mAP_fine_x
+        mlflow_metrics[f'mAP_groups{suffix}'] = mAP_groups_x
+        for cls, r in fine_x.items():
+            if r['num_gt'] > 0:
+                mlflow_metrics[f'ap_fine_{cls}{suffix}'] = r['ap']
+        for grp, r in group_x.items():
+            if r['num_gt'] > 0:
+                mlflow_metrics[f'ap_group_{grp}{suffix}'] = r['ap']
+        logger.info(f'-- IoU={iou_thresh}: mAP_fine={mAP_fine_x:.3f}  mAP_groups={mAP_groups_x:.3f} --')
+
+    save_path = Path(args.save_path) if args.save_path is not None else \
+        cfg.ROOT_DIR / 'output' / cfg.EXP_GROUP_PATH / cfg.TAG / 'default' / 'per_class_ap.json'
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(save_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+
+    mlflow.log_metrics(mlflow_metrics)
+    mlflow.log_artifact(str(save_path))
     logger.info(f'Wrote {save_path}')
     logger.info('Done.')
     mlflow.end_run()
