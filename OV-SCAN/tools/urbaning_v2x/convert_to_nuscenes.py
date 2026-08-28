@@ -250,6 +250,16 @@ class BaseNuscenesConverter:
         with open(self.table_dir / 'native_categories.json', 'w') as f:
             json.dump(self.native_categories_by_sample, f)
 
+        # Sidecar recording the recentering offset (if any) subtracted from points/GT before
+        # writing, so downstream tooling (e.g. late-fusion box merging) can recover true global
+        # coordinates: true_global = local + offset. Zero for converters that don't recenter
+        # (SequenceConverter, FusedEgoConverter both already emit true-global-recoverable frames
+        # via ego_pose/calibrated_sensor); populated for InfraFusionConverter, whose recentered
+        # frame has no other on-disk record of the offset that was applied.
+        offset = getattr(self, 'offset', np.zeros(3))
+        with open(self.table_dir / 'frame_offset.json', 'w') as f:
+            json.dump({'offset': np.asarray(offset).tolist()}, f)
+
         print(f'Wrote {len(sample_table)} samples, {len(self.sample_annotation_table)} annotations, '
               f'{len(self.instance_table)} instances to {self.table_dir}')
 

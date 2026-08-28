@@ -202,10 +202,15 @@ def draw_box_labels(save_path, entries, class_names, intrinsic, extrinsic, width
 
 
 def save_scene(points, gt_boxes, pred_boxes, pred_labels, save_path, width, height,
-               show_labels=False, class_names=None):
+               show_labels=False, class_names=None, point_size=1.5, fixed_cam_params=None):
+    """fixed_cam_params (optional, open3d.camera.PinholeCameraParameters): when given, use this
+    exact camera instead of auto-fitting to this frame's own geometry -- callers that render many
+    frames of the same scene (e.g. a video sequence) can compute this once (see
+    visualize_urbaning_v2x_late_fusion.py's compute_fixed_camera_params) so the zoom/center stays
+    stable across frames instead of jumping around with each frame's own point/box extent."""
     vis = open3d.visualization.Visualizer()
     vis.create_window(visible=False, width=width, height=height)
-    vis.get_render_option().point_size = 1.5
+    vis.get_render_option().point_size = point_size
     vis.get_render_option().background_color = np.zeros(3)
 
     pts = open3d.geometry.PointCloud()
@@ -218,10 +223,13 @@ def save_scene(points, gt_boxes, pred_boxes, pred_labels, save_path, width, heig
     if pred_boxes is not None and len(pred_boxes) > 0:
         add_boxes(vis, pred_boxes, None, labels=pred_labels)
 
-    vis.reset_view_point(True)
     ctr = vis.get_view_control()
-    ctr.set_front([0.0, 0.0, 1.0])
-    ctr.set_up([0.0, 1.0, 0.0])
+    if fixed_cam_params is not None:
+        ctr.convert_from_pinhole_camera_parameters(fixed_cam_params)
+    else:
+        vis.reset_view_point(True)
+        ctr.set_front([0.0, 0.0, 1.0])
+        ctr.set_up([0.0, 1.0, 0.0])
 
     vis.poll_events()
     vis.update_renderer()
