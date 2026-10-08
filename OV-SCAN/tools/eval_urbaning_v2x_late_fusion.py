@@ -57,6 +57,15 @@ from eval_urbaning_v2x_per_class import (
     class_ap,
 )
 
+# Per-intersection infra LiDAR channel names (crossing3 uses 21/22, not 31/32). Duplicated from
+# run_full_dataset_eval.py's INFRA_CHANNELS -- that module is a host-side orchestrator script
+# (shells out to docker/7z), not meant to be imported into this container-side eval code.
+INFRA_CHANNELS = {
+    'crossing1': ['crossing1_11_lidar', 'crossing1_12_lidar', 'crossing1_31_lidar', 'crossing1_32_lidar'],
+    'crossing2': ['crossing2_11_lidar', 'crossing2_12_lidar', 'crossing2_31_lidar', 'crossing2_32_lidar'],
+    'crossing3': ['crossing3_11_lidar', 'crossing3_12_lidar', 'crossing3_21_lidar', 'crossing3_22_lidar'],
+}
+
 VEHICLE_CFG = 'cfgs/nuscenes_models/ov_scan_lidar_urbaning.yaml'
 INFRA_CFG = 'cfgs/nuscenes_models/ov_scan_lidar_urbaning_infra.yaml'
 
@@ -83,6 +92,40 @@ COMBOS = {
     'v2i_v2_late': [VEHICLE2] + INFRA_ALL,
     'full_late': [VEHICLE1, VEHICLE2] + INFRA_ALL,
 }
+
+
+def combo_sources_for(intersection, data_root):
+    """Generalizes the module-level COMBOS (hardcoded to the single crossing2 reference sequence
+    Phase 4 was developed against) to an arbitrary intersection/sequence, pointing at solo-source
+    datasets converted under data_root/{vehicle1_solo, vehicle2_solo, infra_solo_<channel>}.
+    Source dicts are shared BY REFERENCE across every combo that uses them (not copied per combo),
+    so a single run_all_sources_inference pass over unique_sources(...) populates each source's
+    poses/offset/ordered_tokens once and every combo sees it."""
+    vehicle1 = {'label': 'vehicle1', 'mode': 'vehicle', 'cfg_file': VEHICLE_CFG,
+                'data_path': f'{data_root}/vehicle1_solo'}
+    vehicle2 = {'label': 'vehicle2', 'mode': 'vehicle', 'cfg_file': VEHICLE_CFG,
+                'data_path': f'{data_root}/vehicle2_solo'}
+    infra_all = [{'label': ch.rsplit('_', 1)[0], 'mode': 'infra', 'cfg_file': INFRA_CFG,
+                  'data_path': f"{data_root}/infra_solo_{ch.split('_')[1]}"}
+                 for ch in INFRA_CHANNELS[intersection]]
+    return {
+        'i2i_late': infra_all,
+        'v2v_late': [vehicle1, vehicle2],
+        'v2i_v1_late': [vehicle1] + infra_all,
+        'v2i_v2_late': [vehicle2] + infra_all,
+        'full_late': [vehicle1, vehicle2] + infra_all,
+    }
+
+
+def unique_sources(combos):
+    """De-duplicates source dicts shared by reference across multiple combos (see
+    combo_sources_for), by label, for a single run_all_sources_inference pass covering every combo
+    in `combos` at once."""
+    by_label = {}
+    for sources in combos.values():
+        for s in sources:
+            by_label[s['label']] = s
+    return list(by_label.values())
 
 
 def load_gt_by_timestamp(labels_path):
@@ -253,21 +296,30 @@ def weighted_box_fusion(boxes, scores, classes, iou_thresh, coarse_labels=None):
     return np.array(fused_boxes, dtype=np.float32), np.array(fused_scores, dtype=np.float32), fused_classes, fused_labels_arr
 
 
-def build_late_fusion_frames(combo, root_folder, sequence, ckpt, wbf_iou_thresh, logger, max_samples=None):
-    """Runs every source's inference once, WBF-fuses each frame's predictions in the shared global
-    frame, and builds the union-range GT for each frame. Returns a `frames` list (pred_boxes/
-    pred_scores/pred_class/gt_boxes/gt_class per frame) in exactly the structure class_ap expects
-    -- shared by main() below and by any other script that wants this baseline's fused predictions
-    without paying for a second inference pass (e.g. threshold_sensitivity.py, which sweeps scoring
-    thresholds against the SAME fused predictions rather than re-running the model per threshold)."""
-    sources = [dict(s) for s in COMBOS[combo]]  # copy: run_source_inference mutates in place
-    frame_predictions = {}  # label -> predictions_by_token
+def run_all_sources_inference(sources, ckpt, logger, max_samples=None):
+    """Runs run_source_inference once per source (mutating each source dict in place with
+    poses/offset/ordered_tokens) and returns ({label: predictions_by_token}, point_cloud_range).
+
+    Call this ONCE on the de-duplicated union of sources across every combo being evaluated (see
+    unique_sources) -- each combo's fuse_combo_frames below then reuses the same cached
+    predictions, instead of re-inferring a source once per combo it happens to appear in (up to 3x
+    redundant for vehicle1/vehicle2, up to 4x for each infra channel -- see
+    eval_urbaning_v2x_late_fusion_batch.py, which is what this split exists for)."""
+    frame_predictions = {}
     point_cloud_range = None
     for source in sources:
         preds, pcr = run_source_inference(source, ckpt, logger, max_samples)
         frame_predictions[source['label']] = preds
         point_cloud_range = pcr  # identical across all model configs (Phase 1 SS5)
+    return frame_predictions, point_cloud_range
 
+
+def fuse_combo_frames(combo_sources, frame_predictions, point_cloud_range, root_folder, sequence,
+                       wbf_iou_thresh, logger, max_samples=None):
+    """WBF-fuses one combo's sources (a subset of what run_all_sources_inference already ran,
+    cached in frame_predictions) into per-frame fused predictions, plus that combo's own
+    union-range GT. Returns a `frames` list (pred_boxes/pred_scores/pred_class/gt_boxes/gt_class
+    per frame) in exactly the structure class_ap expects."""
     seq_dir = Path(root_folder) / 'dataset' / sequence
     time_sync = pd.read_csv(seq_dir / 'timesync_info.csv').set_index('Unnamed: 0')
     columns = list(time_sync.columns)
@@ -281,7 +333,7 @@ def build_late_fusion_frames(combo, root_folder, sequence, ckpt, wbf_iou_thresh,
         ts_ms = int(time_sync[columns[idx]]['timestamp_ms'])
 
         all_boxes, all_scores, all_classes = [], [], []
-        for source in sources:
+        for source in combo_sources:
             token = source['ordered_tokens'][idx]
             pred_boxes, pred_scores, pred_class, _ = frame_predictions[source['label']][token]
             if len(pred_boxes) == 0:
@@ -300,7 +352,7 @@ def build_late_fusion_frames(combo, root_folder, sequence, ckpt, wbf_iou_thresh,
         for obj in gt_by_ts.get(ts_ms / 1000.0, []):
             p_global = np.asarray(obj['position'])
             in_range = False
-            for source in sources:
+            for source in combo_sources:
                 local = source_to_local(source, source['ordered_tokens'][idx], p_global)
                 if x_min <= local[0] <= x_max and y_min <= local[1] <= y_max:
                     in_range = True
@@ -317,8 +369,73 @@ def build_late_fusion_frames(combo, root_folder, sequence, ckpt, wbf_iou_thresh,
             'gt_boxes': gt_boxes, 'gt_class': gt_class,
         })
         logger.info(f'[{idx + 1}/{num_frames}] {len(boxes_cat)} raw preds -> {len(fused_boxes)} fused, '
-                    f'{len(gt_boxes)} gt boxes in range (union of {len(sources)} sources)')
+                    f'{len(gt_boxes)} gt boxes in range (union of {len(combo_sources)} sources)')
+    return frames
+
+
+def build_late_fusion_frames(combo, root_folder, sequence, ckpt, wbf_iou_thresh, logger, max_samples=None):
+    """Backward-compatible single-combo wrapper (used by main() below and
+    threshold_sensitivity_late_fusion.py): runs inference for just this combo's own sources, then
+    fuses. When evaluating multiple combos on the same sequence, prefer calling
+    run_all_sources_inference once on unique_sources(combos) and fuse_combo_frames per combo
+    instead, to avoid redundant inference on shared sources -- see
+    eval_urbaning_v2x_late_fusion_batch.py."""
+    sources = [dict(s) for s in COMBOS[combo]]  # copy: run_source_inference mutates in place
+    frame_predictions, point_cloud_range = run_all_sources_inference(sources, ckpt, logger, max_samples)
+    frames = fuse_combo_frames(sources, frame_predictions, point_cloud_range, root_folder, sequence,
+                                wbf_iou_thresh, logger, max_samples)
     return frames, sources
+
+
+def compute_ap_sweep(frames, primary_iou, extra_ious, logger=None):
+    """Computes per-class/group AP + mAP at `primary_iou` and each of `extra_ious`, all from the
+    SAME already-fused `frames` (no extra inference or WBF re-fusion) -- mirrors
+    eval_urbaning_v2x_per_class.py's compute_ap_at sweep pattern, reused here so single-combo and
+    full-dataset-batch callers share one implementation. Returns (summary_dict, mlflow_metrics_dict);
+    summary_dict's 'by_iou_thresh' key holds the extra thresholds' results, mirroring
+    eval_urbaning_v2x_per_class.py's on-disk JSON shape."""
+    def compute_ap_at(iou_thresh):
+        fine = {cls: class_ap(frames, cls, iou_thresh, class_of=lambda c: c) for cls in FINE_CLASSES}
+        group = {grp: class_ap(frames, grp, iou_thresh, class_of=lambda c: CANONICAL_TO_GROUP.get(c))
+                 for grp in GROUPS}
+        valid_fine = [r['ap'] for r in fine.values() if r['num_gt'] > 0]
+        valid_group = [r['ap'] for r in group.values() if r['num_gt'] > 0]
+        mAP_fine = float(np.mean(valid_fine)) if valid_fine else float('nan')
+        mAP_groups = float(np.mean(valid_group)) if valid_group else float('nan')
+        return fine, group, mAP_fine, mAP_groups
+
+    fine_results, group_results, mAP_fine, mAP_groups = compute_ap_at(primary_iou)
+    summary = {
+        'match_iou_thresh': primary_iou, 'num_frames': len(frames),
+        'fine_classes': fine_results, 'groups': group_results,
+        'mAP_fine_classes': mAP_fine, 'mAP_groups': mAP_groups, 'by_iou_thresh': {},
+    }
+    mlflow_metrics = {'mAP_fine_classes': mAP_fine, 'mAP_groups': mAP_groups}
+    for cls, r in fine_results.items():
+        if r['num_gt'] > 0:
+            mlflow_metrics[f'ap_fine_{cls}'] = r['ap']
+    for grp, r in group_results.items():
+        if r['num_gt'] > 0:
+            mlflow_metrics[f'ap_group_{grp}'] = r['ap']
+
+    for iou_thresh in extra_ious:
+        fine_x, group_x, mAP_fine_x, mAP_groups_x = compute_ap_at(iou_thresh)
+        suffix = f'_iou{iou_thresh}'
+        summary['by_iou_thresh'][str(iou_thresh)] = {
+            'fine_classes': fine_x, 'groups': group_x,
+            'mAP_fine_classes': mAP_fine_x, 'mAP_groups': mAP_groups_x,
+        }
+        mlflow_metrics[f'mAP_fine_classes{suffix}'] = mAP_fine_x
+        mlflow_metrics[f'mAP_groups{suffix}'] = mAP_groups_x
+        for cls, r in fine_x.items():
+            if r['num_gt'] > 0:
+                mlflow_metrics[f'ap_fine_{cls}{suffix}'] = r['ap']
+        for grp, r in group_x.items():
+            if r['num_gt'] > 0:
+                mlflow_metrics[f'ap_group_{grp}{suffix}'] = r['ap']
+        if logger:
+            logger.info(f'-- IoU={iou_thresh}: mAP_fine={mAP_fine_x:.3f}  mAP_groups={mAP_groups_x:.3f} --')
+    return summary, mlflow_metrics
 
 
 def parse_args():
@@ -329,7 +446,12 @@ def parse_args():
     parser.add_argument('--sequence', type=str, required=True)
     parser.add_argument('--ckpt', type=str, required=True)
     parser.add_argument('--match_iou_thresh', type=float, default=0.25,
-                         help='3D IoU threshold, used both for WBF clustering and per-class AP matching')
+                         help='3D IoU threshold, used both for WBF clustering and the primary per-class AP '
+                              'matching pass -- metrics at this threshold keep unsuffixed names')
+    parser.add_argument('--extra_match_iou_threshs', type=str, default='0.3,0.5',
+                         help='comma-separated additional AP-matching IoU thresholds, swept from the same '
+                              'WBF-fused frames (WBF clustering itself stays at --match_iou_thresh) -- '
+                              'logged/saved with a "_iou<thresh>" suffix. Empty string to disable.')
     parser.add_argument('--max_samples', type=int, default=None)
     parser.add_argument('--save_path', type=str, default=None)
     parser.add_argument('--mlflow_experiment', type=str, default='urbaning_v2x_late_fusion')
@@ -345,22 +467,16 @@ def main():
     frames, sources = build_late_fusion_frames(
         args.combo, args.root_folder, args.sequence, args.ckpt, args.match_iou_thresh, logger, args.max_samples)
 
-    logger.info('Computing per-class AP...')
-    fine_results = {cls: class_ap(frames, cls, args.match_iou_thresh, class_of=lambda c: c) for cls in FINE_CLASSES}
-    group_results = {grp: class_ap(frames, grp, args.match_iou_thresh, class_of=lambda c: CANONICAL_TO_GROUP.get(c))
-                      for grp in GROUPS}
+    extra_threshs = [float(x) for x in args.extra_match_iou_threshs.split(',') if x.strip()]
+    logger.info(f'Computing per-class AP at IoU={args.match_iou_thresh} (primary)'
+                + (f' and IoU={extra_threshs} (extra)' if extra_threshs else '') + '...')
+    summary, mlflow_metrics = compute_ap_sweep(frames, args.match_iou_thresh, extra_threshs, logger)
+    summary['combo'] = args.combo
+    summary['sources'] = [s['label'] for s in sources]
+    summary['sequence'] = args.sequence
+    fine_results, group_results = summary['fine_classes'], summary['groups']
+    mAP_fine, mAP_groups = summary['mAP_fine_classes'], summary['mAP_groups']
 
-    valid_fine_aps = [r['ap'] for r in fine_results.values() if r['num_gt'] > 0]
-    valid_group_aps = [r['ap'] for r in group_results.values() if r['num_gt'] > 0]
-    mAP_fine = float(np.mean(valid_fine_aps)) if valid_fine_aps else float('nan')
-    mAP_groups = float(np.mean(valid_group_aps)) if valid_group_aps else float('nan')
-
-    summary = {
-        'combo': args.combo, 'sources': [s['label'] for s in sources], 'sequence': args.sequence,
-        'match_iou_thresh': args.match_iou_thresh, 'num_frames': len(frames),
-        'fine_classes': fine_results, 'groups': group_results,
-        'mAP_fine_classes': mAP_fine, 'mAP_groups': mAP_groups,
-    }
     save_path = Path(args.save_path) if args.save_path is not None else \
         Path(cfg.ROOT_DIR) / 'output' / 'urbaning_v2x_late_fusion' / args.combo / 'default' / 'per_class_ap.json'
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -379,16 +495,9 @@ def main():
     mlflow.log_params({
         'combo': args.combo, 'sources': '+'.join(s['label'] for s in sources),
         'merge_strategy': 'late_wbf', 'sequence': args.sequence, 'ckpt': args.ckpt,
-        'match_iou_thresh': args.match_iou_thresh,
+        'match_iou_thresh': args.match_iou_thresh, 'extra_match_iou_threshs': args.extra_match_iou_threshs,
         **({'intersection': intersection} if intersection else {}),
     })
-    mlflow_metrics = {'mAP_fine_classes': mAP_fine, 'mAP_groups': mAP_groups}
-    for cls, r in fine_results.items():
-        if r['num_gt'] > 0:
-            mlflow_metrics[f'ap_fine_{cls}'] = r['ap']
-    for grp, r in group_results.items():
-        if r['num_gt'] > 0:
-            mlflow_metrics[f'ap_group_{grp}'] = r['ap']
     mlflow.log_metrics(mlflow_metrics)
     mlflow.log_artifact(str(save_path))
 

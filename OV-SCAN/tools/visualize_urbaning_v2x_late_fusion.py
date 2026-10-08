@@ -27,6 +27,7 @@ Usage:
 """
 import argparse
 import json
+import re
 from pathlib import Path
 
 import mlflow
@@ -39,8 +40,8 @@ from pcdet.utils import common_utils
 
 from mlflow_logging import get_or_create_run
 from eval_urbaning_v2x_late_fusion import (
-    COMBOS, load_gt_by_timestamp, run_source_inference, source_to_global, source_to_local,
-    weighted_box_fusion,
+    COMBOS, combo_sources_for, load_gt_by_timestamp, run_source_inference, source_to_global,
+    source_to_local, weighted_box_fusion,
 )
 from visualize_urbaning_v2x import match_greedy, save_scene
 
@@ -135,6 +136,13 @@ def parse_args():
     parser.add_argument('--root_folder', type=str, required=True)
     parser.add_argument('--sequence', type=str, required=True)
     parser.add_argument('--ckpt', type=str, required=True)
+    parser.add_argument('--data_root', type=str, default=None,
+                         help='dir containing <data_root>/vehicle1_solo, vehicle2_solo, '
+                              'infra_solo_<channel> -- overrides the module-level COMBOS (hardcoded '
+                              'to the crossing2 reference sequence) for other sequences/intersections')
+    parser.add_argument('--intersection', type=str, default=None,
+                         help='required together with --data_root (infra channel naming differs by '
+                              'intersection); default: derived from --sequence (crossing<N>)')
     parser.add_argument('--save_dir', type=str, default=None,
                          help='output dir for images (default: output/urbaning_v2x_late_fusion/<combo>/default/visualizations)')
     parser.add_argument('--score_thresh', type=float, default=0.3, help='min fused score for a box to be drawn')
@@ -168,7 +176,11 @@ def main():
     logger = common_utils.create_logger()
     logger.info(f'----------------- UrbanIng-V2X late-fusion visualization: {args.combo} -----------------')
 
-    sources = [dict(s) for s in COMBOS[args.combo]]
+    if args.data_root:
+        intersection = args.intersection or re.search(r'crossing\d+', args.sequence).group(0)
+        sources = [dict(s) for s in combo_sources_for(intersection, args.data_root)[args.combo]]
+    else:
+        sources = [dict(s) for s in COMBOS[args.combo]]
     frame_predictions = {}
     point_cloud_range = None
     class_names = None
@@ -283,9 +295,10 @@ def main():
         json.dump(summary, f, indent=2)
 
     run_name = args.run_name or f'{args.combo}__{args.sequence}'
+    intersection_tag = args.intersection or re.search(r'crossing\d+', args.sequence).group(0)
     run = get_or_create_run(cfg.ROOT_DIR, args.mlflow_experiment, run_name, tags={
         'fusion_type': args.combo, 'sources': '+'.join(s['label'] for s in sources),
-        'merge_strategy': 'late_wbf', 'sequence': args.sequence,
+        'merge_strategy': 'late_wbf', 'sequence': args.sequence, 'intersection': intersection_tag,
     })
     logger.info(f'MLflow run: {args.mlflow_experiment}/{run_name} ({run.info.run_id})')
     mlflow.log_params({'score_thresh': args.score_thresh})
