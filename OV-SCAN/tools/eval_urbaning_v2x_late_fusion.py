@@ -315,11 +315,21 @@ def run_all_sources_inference(sources, ckpt, logger, max_samples=None):
 
 
 def fuse_combo_frames(combo_sources, frame_predictions, point_cloud_range, root_folder, sequence,
-                       wbf_iou_thresh, logger, max_samples=None):
+                       wbf_iou_thresh, logger, max_samples=None, infra_weight=1.0):
     """WBF-fuses one combo's sources (a subset of what run_all_sources_inference already ran,
     cached in frame_predictions) into per-frame fused predictions, plus that combo's own
     union-range GT. Returns a `frames` list (pred_boxes/pred_scores/pred_class/gt_boxes/gt_class
-    per frame) in exactly the structure class_ap expects."""
+    per frame) in exactly the structure class_ap expects.
+
+    infra_weight (default 1.0, no-op): a scalar multiplier applied to every infra-source
+    detection's score BEFORE it reaches weighted_box_fusion -- vehicle-source scores are always
+    left at 1.0x. Since weighted_box_fusion uses the score it's given for the clustering order,
+    the geometric weighted average, AND the fused confidence (plain mean of cluster scores), this
+    one knob down-weights infra consistently across all three: infra boxes pull the fused
+    geometry less, and infra-heavy clusters end up with a lower fused score (ranking lower in
+    AP). Explores the Urbaning_PHASE_5.md Sec.7 hypothesis that full_late's infra sources, each
+    individually weaker than a vehicle source, may be dragging down WBF's output rather than
+    purely adding coverage."""
     seq_dir = Path(root_folder) / 'dataset' / sequence
     time_sync = pd.read_csv(seq_dir / 'timesync_info.csv').set_index('Unnamed: 0')
     columns = list(time_sync.columns)
@@ -341,7 +351,8 @@ def fuse_combo_frames(combo_sources, frame_predictions, point_cloud_range, root_
             xyz_g, yaw_g = source_to_global(source, token, pred_boxes[:, :3], pred_boxes[:, 6])
             boxes_g = np.concatenate([xyz_g, pred_boxes[:, 3:6], yaw_g[:, None]], axis=1)
             all_boxes.append(boxes_g)
-            all_scores.append(pred_scores)
+            weight_mult = infra_weight if source['mode'] == 'infra' else 1.0
+            all_scores.append(pred_scores * weight_mult)
             all_classes.extend(pred_class)
         boxes_cat = np.concatenate(all_boxes, axis=0) if all_boxes else np.zeros((0, 7), dtype=np.float32)
         scores_cat = np.concatenate(all_scores, axis=0) if all_scores else np.zeros((0,), dtype=np.float32)
@@ -373,7 +384,8 @@ def fuse_combo_frames(combo_sources, frame_predictions, point_cloud_range, root_
     return frames
 
 
-def build_late_fusion_frames(combo, root_folder, sequence, ckpt, wbf_iou_thresh, logger, max_samples=None):
+def build_late_fusion_frames(combo, root_folder, sequence, ckpt, wbf_iou_thresh, logger, max_samples=None,
+                              infra_weight=1.0):
     """Backward-compatible single-combo wrapper (used by main() below and
     threshold_sensitivity_late_fusion.py): runs inference for just this combo's own sources, then
     fuses. When evaluating multiple combos on the same sequence, prefer calling
@@ -383,7 +395,7 @@ def build_late_fusion_frames(combo, root_folder, sequence, ckpt, wbf_iou_thresh,
     sources = [dict(s) for s in COMBOS[combo]]  # copy: run_source_inference mutates in place
     frame_predictions, point_cloud_range = run_all_sources_inference(sources, ckpt, logger, max_samples)
     frames = fuse_combo_frames(sources, frame_predictions, point_cloud_range, root_folder, sequence,
-                                wbf_iou_thresh, logger, max_samples)
+                                wbf_iou_thresh, logger, max_samples, infra_weight=infra_weight)
     return frames, sources
 
 
