@@ -314,6 +314,31 @@ def run_all_sources_inference(sources, ckpt, logger, max_samples=None):
     return frame_predictions, point_cloud_range
 
 
+def gt_in_union_range(combo_sources, idx, gt_by_ts, ts_ms, point_cloud_range):
+    """A GT box is kept if it falls inside *any* participating source's own local +-54m window
+    for this frame (checked in that source's own frame via source_to_local) -- the union-range GT
+    policy established for late fusion (see module docstring), reused as-is by any other fusion
+    strategy over the same combo_sources/frame structure (e.g. intermediate/BEV fusion). Returns
+    (gt_boxes, gt_class) in the same (N,7)/[cls,...] shape class_ap expects."""
+    x_min, y_min, _, x_max, y_max, _ = point_cloud_range
+    gt_boxes, gt_class = [], []
+    for obj in gt_by_ts.get(ts_ms / 1000.0, []):
+        p_global = np.asarray(obj['position'])
+        in_range = False
+        for source in combo_sources:
+            local = source_to_local(source, source['ordered_tokens'][idx], p_global)
+            if x_min <= local[0] <= x_max and y_min <= local[1] <= y_max:
+                in_range = True
+                break
+        if not in_range:
+            continue
+        l, w, h = obj['dimension']
+        gt_boxes.append([*p_global, l, w, h, obj['orientation']])
+        gt_class.append(GT_NATIVE_TO_CANONICAL.get(obj['object_type']))
+    gt_boxes = np.array(gt_boxes, dtype=np.float32) if gt_boxes else np.zeros((0, 7), dtype=np.float32)
+    return gt_boxes, gt_class
+
+
 def fuse_combo_frames(combo_sources, frame_predictions, point_cloud_range, root_folder, sequence,
                        wbf_iou_thresh, logger, max_samples=None, infra_weight=1.0):
     """WBF-fuses one combo's sources (a subset of what run_all_sources_inference already ran,
@@ -336,7 +361,6 @@ def fuse_combo_frames(combo_sources, frame_predictions, point_cloud_range, root_
     gt_by_ts = load_gt_by_timestamp(Path(root_folder) / 'labels' / f'{sequence}.json')
 
     num_frames = len(columns) if max_samples is None else min(max_samples, len(columns))
-    x_min, y_min, _, x_max, y_max, _ = point_cloud_range
 
     frames = []
     for idx in range(num_frames):
@@ -359,21 +383,7 @@ def fuse_combo_frames(combo_sources, frame_predictions, point_cloud_range, root_
         fused_boxes, fused_scores, fused_classes, _ = weighted_box_fusion(
             boxes_cat, scores_cat, all_classes, wbf_iou_thresh)
 
-        gt_boxes, gt_class = [], []
-        for obj in gt_by_ts.get(ts_ms / 1000.0, []):
-            p_global = np.asarray(obj['position'])
-            in_range = False
-            for source in combo_sources:
-                local = source_to_local(source, source['ordered_tokens'][idx], p_global)
-                if x_min <= local[0] <= x_max and y_min <= local[1] <= y_max:
-                    in_range = True
-                    break
-            if not in_range:
-                continue
-            l, w, h = obj['dimension']
-            gt_boxes.append([*p_global, l, w, h, obj['orientation']])
-            gt_class.append(GT_NATIVE_TO_CANONICAL.get(obj['object_type']))
-        gt_boxes = np.array(gt_boxes, dtype=np.float32) if gt_boxes else np.zeros((0, 7), dtype=np.float32)
+        gt_boxes, gt_class = gt_in_union_range(combo_sources, idx, gt_by_ts, ts_ms, point_cloud_range)
 
         frames.append({
             'pred_boxes': fused_boxes, 'pred_scores': fused_scores, 'pred_class': fused_classes,
