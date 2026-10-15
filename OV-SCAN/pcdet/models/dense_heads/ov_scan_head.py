@@ -512,8 +512,12 @@ class OVScanHead(nn.Module):
             gt_grounding_sam = batch_dict['gt_grounding_sam']
             # gt_size_labels = batch_dict['gt_size_labels']
             images_dict = []
-            camera_ids = batch_dict['cam_ids']
-            camera_images = batch_dict['raw_imgs']
+            # .get() with an empty-per-sample default: datasets with no CAMERA_CONFIG (e.g.
+            # UrbanIng-V2X) never populate these keys. images_dict is never actually read inside
+            # loss() (only gt_grounding_sam-derived bbox_grounding_sam matters there), so this is
+            # a safe no-op for camera-equipped datasets and just avoids a KeyError otherwise.
+            camera_ids = batch_dict.get('cam_ids', [[] for _ in range(len(gt_boxes))])
+            camera_images = batch_dict.get('raw_imgs', [[] for _ in range(len(gt_boxes))])
             for batch_id in range(len(camera_ids)):
                 cam_frame_dict = {}
                 for image_id in range(len(camera_ids[batch_id])):

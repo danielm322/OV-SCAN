@@ -6,7 +6,19 @@ import time
 import glob
 from torch.nn.utils import clip_grad_norm_
 from pcdet.utils import common_utils, commu_utils
-import wandb
+try:
+    # Optional: this environment's wandb (0.18.0) was generated against an older protobuf and
+    # fails to import against the newer protobuf version installed for mlflow (see
+    # docker/OV-SCAN.Dockerfile's comment on that upgrade) -- a pure package-version conflict, not
+    # something fixable by any training-loop code. Training works fine without it: every call
+    # site below is guarded by `_WANDB_AVAILABLE`, so an unavailable/disabled wandb just means no
+    # wandb logging, not a crash. WANDB_MODE=disabled (or any unset/invalid mode) also lands here
+    # since the import itself is what fails, independent of that env var.
+    import wandb
+    _WANDB_AVAILABLE = os.environ.get('WANDB_MODE') != 'disabled'
+except ImportError:
+    wandb = None
+    _WANDB_AVAILABLE = False
 from datetime import datetime
 import pytz
 
@@ -99,7 +111,8 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
             for key, val in tb_dict.items():
                 wandb_log_dict['train/' + key] = val
                 disp_dict[key] = val
-            wandb.log(wandb_log_dict)
+            if _WANDB_AVAILABLE:
+                wandb.log(wandb_log_dict)
             
             if use_logger_to_record:
                 if accumulated_iter % logger_iter_interval == 0 or cur_it == start_it or cur_it + 1 == total_it_each_epoch:
@@ -174,7 +187,7 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
     augment_disable_flag = False
 
     # initialize wandb
-    if rank == 0:
+    if rank == 0 and _WANDB_AVAILABLE:
         current_date = datetime.now(pytz.timezone('US/Eastern')).strftime("%Y-%m-%d-%H-%M-%S")
         wandb.init(project='BEVWorld',
                    name=f'{cfg.MODEL.NAME}_{current_date}',
@@ -236,10 +249,11 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                 )
 
         # save final model to wandb
-        if rank == 0:
+        if rank == 0 and _WANDB_AVAILABLE:
             wandb.save(ckpt_name)
-    
-    wandb.finish()
+
+    if _WANDB_AVAILABLE:
+        wandb.finish()
 
 
 def model_state_to_cpu(model_state):

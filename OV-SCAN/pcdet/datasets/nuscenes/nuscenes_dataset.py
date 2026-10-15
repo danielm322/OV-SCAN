@@ -410,7 +410,7 @@ class NuScenesDataset(DatasetTemplate):
             pickle.dump(all_db_infos, f)
 
 
-def create_nuscenes_info(version, data_path, save_path, max_sweeps=10, with_cam=False):
+def create_nuscenes_info(version, data_path, save_path, max_sweeps=10, with_cam=False, train_scene_names=None):
     from nuscenes.nuscenes import NuScenes
     from nuscenes.utils import splits
     from . import nuscenes_utils
@@ -432,7 +432,9 @@ def create_nuscenes_info(version, data_path, save_path, max_sweeps=10, with_cam=
     elif version == 'v1.0-custom':
         # Non-official dataset (e.g. converted from a third-party source): scene names won't
         # appear in nuscenes-devkit's hardcoded official splits, so treat every available scene
-        # as a val scene instead of filtering against splits.*.
+        # as a val scene instead of filtering against splits.*, UNLESS the caller supplies an
+        # explicit train_scene_names partition (e.g. a real train/held-out-intersection split for
+        # fine-tuning) -- in that case use it instead of the all-to-val default below.
         train_scenes = []
         val_scenes = None
     else:
@@ -441,7 +443,11 @@ def create_nuscenes_info(version, data_path, save_path, max_sweeps=10, with_cam=
     available_scenes = nuscenes_utils.get_available_scenes(nusc)
     available_scene_names = [s['name'] for s in available_scenes]
     if version == 'v1.0-custom':
-        val_scenes = available_scene_names
+        if train_scene_names is not None:
+            train_scenes = list(train_scene_names)
+            val_scenes = [s for s in available_scene_names if s not in set(train_scenes)]
+        else:
+            val_scenes = available_scene_names
     train_scenes = list(filter(lambda x: x in available_scene_names, train_scenes))
     val_scenes = list(filter(lambda x: x in available_scene_names, val_scenes))
     train_scenes = set([available_scenes[available_scene_names.index(s)]['token'] for s in train_scenes])
