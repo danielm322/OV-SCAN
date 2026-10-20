@@ -40,6 +40,9 @@ def parse_config():
     parser.add_argument('--tcp_port', type=int, default=18888, help='tcp port for distrbuted training')
     parser.add_argument('--sync_bn', action='store_true', default=False, help='whether to use sync bn')
     parser.add_argument('--fix_random_seed', action='store_true', default=False, help='')
+    parser.add_argument('--freeze_backbone', action='store_true', default=False,
+                         help='freeze vfe/backbone_3d/map_to_bev_module/backbone_2d (requires_grad=False '
+                              'and pinned eval mode); only dense_head trains. Phase 9 ablation flag.')
     parser.add_argument('--ckpt_save_interval', type=int, default=1, help='number of training epochs')
     parser.add_argument('--local-rank', type=int, default=None, help='local rank for distributed training')
     parser.add_argument('--max_ckpt_save_num', type=int, default=30, help='max number of saved checkpoint')
@@ -141,6 +144,25 @@ def main():
     if args.sync_bn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.cuda()
+
+    if args.freeze_backbone:
+        frozen_module_names = ['vfe', 'backbone_3d', 'map_to_bev_module', 'backbone_2d']
+        for name in frozen_module_names:
+            module = getattr(model, name, None)
+            if module is None:
+                continue
+            for p in module.parameters():
+                p.requires_grad = False
+            module.eval()
+            # train_utils_wandb.py's train_one_epoch calls model.train() every iteration, which
+            # recursively re-enables train mode on every child -- that would keep letting
+            # BatchNorm1d/2d running_mean/running_var drift inside backbone_3d/backbone_2d despite
+            # requires_grad=False (unlike the existing clip_img_encoder freeze in ov_scan_head.py,
+            # which is safe without this because CLIP's ViT uses LayerNorm, not BatchNorm). Pin
+            # .train() to a no-op so these submodules stay in eval mode regardless.
+            module.train = (lambda self, mode=True: self).__get__(module)
+        logger.info('==> --freeze_backbone: froze %s (requires_grad=False + pinned eval mode); '
+                    'only dense_head remains trainable' % frozen_module_names)
 
     optimizer = build_optimizer(model, cfg.OPTIMIZATION)
 
