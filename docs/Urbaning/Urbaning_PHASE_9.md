@@ -10,7 +10,7 @@ gain but at a real group-mAP cost (-10 to -12%) from `heavy_vehicle`/`two_wheele
 ruled out as a net-negative trade. None of the three variants structurally fixes the hallucination
 mechanism itself (proportionally still ~82-87% of `van` predictions are unmatched to any GT,
 barely different from baseline) — they shrink the flood's absolute volume, not its qualitative
-cause. The separate `car`/`van` CLIP-mislabeling mechanism from Phase 7 §5.3 is, as expected,
+cause. The separate `car`/`van` CLIP-mislabeling mechanism from Phase 8 §2 is, as expected,
 completely untouched by any of these variants.
 
 ---
@@ -23,7 +23,7 @@ Phase 7 found that fine-tuning `v2i_vehicle1` improved group-level mAP substanti
 noise that the frozen CLIP step still classifies, mostly into "van" (§5.1: 87% of `van` predictions
 unmatched to any GT, median score ~0.0001). Phase 8 tested halving `hm_weight` and ruled it out —
 essentially no change to the over-firing behavior, and a net-negative trade on group mAP. A
-separate non-training investigation (Phase 7 §5.3) found a second, distinct mechanism coexisting in
+separate non-training investigation (Phase 8 §2) found a second, distinct mechanism coexisting in
 the same checkpoint's `van` output: among `van` predictions with confidence ≥0.5, 68.5% are real
 cars confidently mislabeled "van" by the frozen CLIP alignment step — architecturally unfixable by
 anything in this phase, since the alignment head gets exactly zero gradient on UrbanIng-V2X data
@@ -186,17 +186,17 @@ Two things stand out:
   qualitative fix** — consistent with this being a persistent heatmap-selectivity characteristic,
   not something any of these three levers removes outright.
 - **`matched_car`% stays flat** (8.3-11.2%, no trend) across every variant, confirming — exactly as
-  predicted architecturally in §1 — that none of these changes touches the separate Phase 7 §5.3
+  predicted architecturally in §1 — that none of these changes touches the separate Phase 8 §2
   CLIP-mislabeling mechanism at all. That remains out of scope for any training-recipe lever.
 - **(a)'s score calibration is dramatically better** (p90 score 0.51 vs. baseline's 0.08, vs. 0.25/0.16
   for b/c) — a much larger share of its `van` predictions carry informative, decisive confidence
   scores rather than clustering near zero. This matters practically: it makes (a)'s checkpoint far
-  more usable with a deployment score threshold (§5.3's recommendation) than the baseline, whose
+  more usable with a deployment score threshold (Phase 8 §2's recommendation) than the baseline, whose
   scores are almost all ~0.0001 regardless of correctness.
 
 ### 5.3 Score-threshold sweep re-check on (a)
 
-Re-ran `sweep_score_threshold.py` on (a)'s checkpoint to confirm Phase 7 §5.3's "free win except
+Re-ran `sweep_score_threshold.py` on (a)'s checkpoint to confirm Phase 8 §2's "free win except
 `van`" pattern still holds (rather than assuming it): at threshold 0.2, `car` precision 0.927,
 `vehicle` (group) precision 0.943, `two_wheelers` 0.937, `truck` 0.858 — all comparable to or better
 than the equivalent baseline-checkpoint sweep — while `van` precision plateaus at 0.27, the same
@@ -216,14 +216,14 @@ a trade-off.
 offer is matched or exceeded by (a) alone, at a real cost (10-12% group mAP regression) that (a)
 doesn't pay. Freezing the backbone is not the right lever here.
 
-**Still deploy with a ~0.2-0.3 score threshold** (`DENSE_HEAD.POST_PROCESSING.SCORE_THRESH`, Phase 7
-§5.3) on top of (a)'s checkpoint — confirmed compatible and, if anything, more usable than before
+**Still deploy with a ~0.2-0.3 score threshold** (`DENSE_HEAD.POST_PROCESSING.SCORE_THRESH`, Phase 8
+§2) on top of (a)'s checkpoint — confirmed compatible and, if anything, more usable than before
 given (a)'s better score calibration.
 
 **What remains unsolved, by design:** the `van` hallucination mechanism itself (heatmap
 over-selectivity) is dampened in absolute volume by (a) but not structurally fixed — ~84% of `van`
 predictions are still unmatched to any GT. And the separate `car`/`van` CLIP-mislabeling mechanism
-(Phase 7 §5.3) is completely unaffected by anything in Phases 8-9, as predicted: it's gated on the
+(Phase 8 §2) is completely unaffected by anything in Phases 8-9, as predicted: it's gated on the
 frozen alignment head, which gets zero gradient on this dataset regardless of LR, loss weights, or
 which submodules are frozen. Fixing it would require either adding grounding-SAM-style supervision
 for the alignment head (a new data/annotation effort, not a training-recipe tweak) or revisiting the

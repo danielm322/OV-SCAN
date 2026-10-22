@@ -4,11 +4,13 @@
 `pretrained/ov_scan_lidar.pth` strictly zero-shot). Built the training infrastructure this project
 never needed before — a real train/val split, a usable `train.py` invocation, several blocking
 bug fixes — and ran an 8-epoch fine-tune of `v2i_vehicle1` on crossing1+crossing2, evaluated on
-held-out crossing3. **Mixed, now well-understood result**: group-level mAP improved substantially
+held-out crossing3. **Mixed, informative result**: group-level mAP improved substantially
 across every IoU threshold (+38% to +97%), fine-class mAP stayed roughly flat with a notable
 localization-quality improvement at strict IoU, alongside a real regression in `van` precision
-(explosion in false-positive count) that turned out to have two distinct causes (§5.1, §5.3), one
-of which (§5.3) is fixable today with a free, no-retraining deployment score threshold.
+(explosion in false-positive count), investigated directly in §5.1. §5.1 traced it to a
+proposal-selectivity problem (the heatmap over-firing on the shared car/van channel), not a simple
+classification-boundary shift — fix attempts and a second, distinct mechanism are covered in
+[Phase 8](Urbaning_PHASE_8.md), and a further training-recipe fix in [Phase 9](Urbaning_PHASE_9.md).
 
 ---
 
@@ -237,118 +239,13 @@ also means raw full-PR-curve AP somewhat overstates the practical severity for `
 a deployment using any reasonable confidence threshold would see far less of this effect than the
 mAP number alone suggests.
 
-### 5.2 Testing the `hm_weight` fix (2026-10-15)
+### 5.2 Fix attempts and the full `van` diagnosis
 
-§5.1's recommended next step was to test whether a smaller `hm_weight` reins in the car-channel
-proposal-selectivity loss without giving up the group-level gains. Tested directly: new config
-`ov_scan_lidar_urbaning_v2i_vehicle1_finetune_hmw0p5.yaml`, identical to the baseline fine-tune
-config in every field except `hm_weight: 0.5` (half of the baseline's `1.0`), trained for the same
-8 epochs on the same crossing1+crossing2 split, evaluated on the identical 1400-frame held-out
-crossing3 set with both tools from §5/§5.1.
-
-| | Zero-shot | Fine-tuned `hm_weight=1.0` | Fine-tuned `hm_weight=0.5` |
-|---|---|---|---|
-| mAP_groups @0.25 | 0.422 | 0.584 | 0.569 |
-| mAP_groups @0.5 | 0.223 | 0.440 | 0.430 |
-| mAP_fine @0.25 | 0.250 | 0.245 | 0.243 |
-| mAP_fine @0.5 | 0.141 | 0.190 | 0.192 |
-| `van` AP @0.25 | 0.443 | 0.240 | **0.213** |
-| `van` total predictions (1400 frames) | 8,566 | 145,819 | 112,805 |
-| `van` unmatched (hallucination) % | 36.5% | 87.0% | **85.5%** |
-| `van` median prediction score | 0.044 | 0.0001 | 0.0002 |
-| `car` AP @0.25 | 0.571 | 0.369 | 0.421 |
-
-**Halving `hm_weight` does not fix the problem, and is a net-negative trade.** Prediction volume
-dropped ~23% (145,819→112,805) but the unmatched/hallucination fraction barely moved (87.0%→85.5%)
-and the median confidence is still essentially zero (0.0001→0.0002) — the proposal-selectivity
-problem identified in §5.1 is still fully present, just slightly smaller in absolute volume. Worse,
-group-level mAP *regressed* slightly at every threshold (mAP_groups @0.25: 0.584→0.569; @0.5:
-0.440→0.430) — exactly the gains §5.1 wanted to protect. `van` AP itself also got slightly worse,
-not better (0.240→0.213), since AP is sensitive to the *relative* rank of the small amount of
-genuine signal against the (still enormous) noise floor, not just the noise floor's absolute size.
-The one clear win is `car` AP, which improved (0.369→0.421) — consistent with a less dominant
-heatmap loss leaving more "room" for the already-strong `car` signal, but this doesn't make up for
-the lack of improvement everywhere else.
-
-**Conclusion: `hm_weight` is not the right lever, at least not a simple halving of it.** The
-mechanism from §5.1 (heatmap loss pushing hardest on the class with the most GT instances) is real,
-but scaling its weight down just slows convergence toward the same qualitative over-firing
-behavior rather than changing it — by epoch 8, the heatmap has still learned to fire broadly across
-the car channel; it's not primarily a *loss-weight-magnitude* problem. This points toward the
-*other* named candidate (a lower peak LR with more epochs, addressing training-dynamics/overfitting
-rather than the static loss weighting) as the more promising remaining lever, or a different kind
-of fix entirely — e.g. a deployment-side score threshold (§5.1 already noted ~0.3 filters out ~92%
-of the noise), or an architectural cap on how many proposals one heatmap channel can contribute per
-frame — rather than continuing to tune `hm_weight` itself.
-
-### 5.3 Non-training score-threshold exploration (2026-10-15)
-
-§5.1/§5.2 both treat the fine-tuned checkpoint's prediction set as fixed and look for either a
-root-cause explanation or a retraining fix. A third, much cheaper option needs no retraining at
-all: filter predictions by confidence at inference/deployment time. One fact makes this worth
-checking directly rather than assuming: `OVScanHead.decode_bbox()`'s own score filter reads
-`DENSE_HEAD.POST_PROCESSING.SCORE_THRESH`, which every config in this project sets to **0.0** (not
-the different, unused-by-this-path `0.1` in the top-level `MODEL.POST_PROCESSING` block) — so every
-frame always returns all `NUM_PROPOSALS=200` raw proposals regardless of confidence, and every AP
-number in §5/§5.1/§5.2 is computed over the *full* PR curve, which is threshold-invariant by
-construction. AP can never show what choosing an actual deployment cutoff would do; only
-precision/recall *at* a specific threshold can. Built `tools/sweep_score_threshold.py` to measure
-exactly that, on the `hm_weight=1.0` checkpoint (the best group-level performer), swept over
-`[0.0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.7]` at IoU≥0.25, full 1400-frame held-out set:
-
-| score ≥ | car P / R | truck P / R | cyclist P / R | pedestrian P / R | **van P / R** | vehicle (group) P / R |
-|---|---|---|---|---|---|---|
-| 0.0 | 0.429 / 0.378 | 0.178 / 0.816 | 0.112 / 0.792 | 0.041 / 0.573 | 0.031 / 0.891 | 0.165 / 0.840 |
-| 0.1 | 0.967 / 0.321 | 0.853 / 0.323 | 0.692 / 0.678 | 0.550 / 0.373 | 0.262 / 0.733 | 0.950 / 0.667 |
-| 0.2 | 0.978 / 0.304 | 0.898 / 0.263 | 0.744 / 0.659 | 0.664 / 0.335 | 0.271 / 0.675 | 0.958 / 0.612 |
-| 0.3 | 0.984 / 0.285 | 0.933 / 0.231 | 0.784 / 0.645 | 0.747 / 0.302 | 0.273 / 0.622 | 0.962 / 0.566 |
-| 0.5 | 0.993 / 0.211 | 0.947 / 0.179 | 0.831 / 0.602 | 0.851 / 0.243 | 0.266 / 0.399 | 0.970 / 0.394 |
-| 0.7 | 0.997 / 0.080 | 1.000 / 0.066 | 0.899 / 0.495 | 0.907 / 0.170 | 0.295 / 0.183 | 0.968 / 0.156 |
-
-**A score threshold is a clear, free win for every class except `van`.** `car`/`truck`/`cyclist`/
-`pedestrian` precision all climb cleanly and substantially as the threshold rises (`car`:
-0.429→0.997; `pedestrian`: 0.041→0.907), confirming that for those classes the bulk of the
-low-confidence volume really is disposable noise, exactly the mechanism §5.1 described. A
-threshold around 0.2–0.3 looks like a good general-purpose operating point: strong precision across
-the board (car ≥0.98, truck ≥0.90, cyclist ≥0.74, pedestrian ≥0.66, vehicle-group ≥0.96) while
-keeping recall reasonable (car ~0.29–0.30, cyclist ~0.65, vehicle-group ~0.57–0.61).
-
-**But `van` precision never rises above ~0.27–0.30, at *any* threshold up to 0.7** — flat, while
-every other class's precision keeps climbing. That is the signature of a different failure mode
-than the one driving the bulk volume: thresholding removes low-confidence noise, but something
-else is keeping `van` wrong even among its most confident predictions. Checked directly: reran
-`investigate_cross_class_fps.py` (extended with a `--min_score` filter) restricted to `van`
-predictions with score ≥0.5, on the same checkpoint:
-
-| | all `van` preds (§5.1, unfiltered) | `van` preds with score ≥0.5 |
-|---|---|---|
-| total | 145,819 | 7,594 |
-| `unmatched` (hallucination) | 87.0% | **0.8%** |
-| `matched_car` (right place, wrong label) | 8.9% | **68.5%** |
-| `matched_van` (correct) | 3.1% | 26.6% |
-| median score | 0.0001 | 0.67 |
-
-**This reopens, and now actually confirms, the original §5.1 "frozen CLIP boundary shift"
-hypothesis — just for a different population than first assumed.** §5.1 disproved it as the
-explanation for the *aggregate* volume (dominated by near-zero-confidence hallucination). But
-restricted to confident, well-localized detections, the picture flips entirely: 68.5% of
-high-confidence `van` predictions are real, correctly-localized `car`s that CLIP confidently labels
-"van" instead — almost no hallucination at all (0.8%) in this slice. Two genuinely distinct
-mechanisms coexist in the same checkpoint's `van` output: a low-confidence proposal-selectivity
-flood (§5.1/§5.2, fixable in principle by reining in heatmap over-firing) and a separate,
-high-confidence classification-boundary error on real cars (not touched by either §5.1's heatmap
-story or §5.2's `hm_weight` experiment, and not removable by any score threshold since the
-threshold doesn't distinguish "confidently right" from "confidently wrong").
-
-**Practical recommendation:** adopt a deployment score threshold around 0.2–0.3 — it is a free,
-no-retraining precision win for every class/group *except* `van`, including the practically more
-relevant `vehicle` group (car+van combined), which already reaches ≥0.96 precision at this
-threshold specifically *because* group-level scoring absorbs the car/van confusion rather than
-being hurt by it. For any use case that needs the fine-grained `car`/`van` distinction specifically
-(not just "is this a vehicle"), neither a score threshold nor the `hm_weight` change (§5.2) fixes
-it — that would require addressing the CLIP alignment step's car/van decision boundary directly
-(e.g. prompt/vocabulary changes, or training the alignment head after all), a different kind of fix
-than anything tried in this phase.
+Two fix attempts for the `van` problem diagnosed above — halving `hm_weight`, and a non-training
+deployment score threshold — and the second, distinct high-confidence CLIP-mislabeling mechanism
+that the score-threshold investigation surfaced, are covered in full in
+[Phase 8](Urbaning_PHASE_8.md). A further training-recipe fix (lower LR + more epochs) is covered
+in [Phase 9](Urbaning_PHASE_9.md).
 
 ## 6. Conclusion and recommendation
 
@@ -357,28 +254,22 @@ training infrastructure itself, which is the primary deliverable of this phase (
 and fixed in §2 was previously completely unexercised in this project). The group-level
 improvement is substantial and likely the more practically relevant metric (an urban-intersection
 safety system cares more about "is this a vehicle/pedestrian/two-wheeler" than fine-grained
-car-vs-van distinction). The `van` regression turned out to have **two distinct causes**: a
-low-confidence proposal-selectivity flood (§5.1) and a separate high-confidence classification
-error on real cars (§5.3) — not one problem with one fix. §5.2 ruled out `hm_weight` reduction as a
-fix for the first cause (it doesn't help, and costs a small amount of group-level mAP). §5.3 found
-that a deployment score threshold (~0.2–0.3) is a genuine free win for every class/group except
-`van` specifically, including the more practically relevant `vehicle` group — but cannot fix `van`
-itself, since its high-confidence errors are confidently-wrong labels, not noise.
+car-vs-van distinction). The `van` regression, diagnosed in §5.1 as a proposal-selectivity flood
+(not a simple classification-boundary shift), turned out on further investigation
+([Phase 8](Urbaning_PHASE_8.md)) to have a **second, coexisting cause** — a separate
+high-confidence classification error on real cars — neither of which a simple fix (loss
+reweighting, score thresholding) resolves outright; see Phase 8 for the full diagnosis and
+recommendation, and [Phase 9](Urbaning_PHASE_9.md) for a training-recipe fix that does improve on
+this phase's baseline checkpoint.
 
 **Natural next steps**, not attempted in this phase:
-- **Recommended default going forward:** deploy the `hm_weight=1.0` fine-tuned checkpoint (§4/§5)
-  with a score threshold of ~0.2–0.3 (§5.3) — the single highest-value, zero-cost change available
-  right now, and a straightforward config change (`DENSE_HEAD.POST_PROCESSING.SCORE_THRESH`) rather
-  than a code or training change.
-- If the fine-grained `car`/`van` distinction specifically matters for a use case: address the CLIP
-  alignment step's car/van decision boundary directly (§5.3) — e.g. prompt/vocabulary tuning, or
-  reconsidering `align_weight: 0.0`'s "never train the alignment head" decision from this phase's
-  original scope (§1) — rather than more heatmap/loss-weight tuning, which §5.2/§5.3 showed doesn't
-  touch this specific error mode.
-- The remaining named candidate from §5.1/§5.2 for the *low-confidence* flood specifically: a lower
-  peak LR with more epochs, to test whether the heatmap over-firing is a training-dynamics/
-  convergence effect rather than a static loss-weighting one. Lower priority now that §5.3 shows a
-  threshold already cleans up that flood's practical impact for free.
+- Test the two named candidates for the *low-confidence* flood specifically: a reduced `hm_weight`,
+  and a lower peak LR with more epochs, to see whether the heatmap over-firing is a static
+  loss-weighting effect or a training-dynamics/convergence one. **Done in Phase 8 §1 (ruled out)
+  and Phase 9 (adopted as the new default), respectively.**
+- Check whether a non-training deployment score threshold alone already cleans up the flood's
+  practical impact for free. **Done in [Phase 8](Urbaning_PHASE_8.md) §2** — yes for every
+  class/group except `van`, which turned out to have a second, untouched failure mode.
 - The original motivating experiment: retry Phase 3 §8's widened-`POINT_CLOUD_RANGE`
   `v2i_vehicle1` config, now training on the wider window instead of zero-shot, to see whether
   fine-tuning lifts the catastrophic 0.28→0.007 collapse that started this phase.
@@ -391,15 +282,16 @@ itself, since its high-confidence errors are confidently-wrong labels, not noise
 - `tools/urbaning_v2x/build_v2i_vehicle1_multiseq_dataset.py` — multi-sequence dataset builder (§3)
 - `tools/cfgs/nuscenes_models/ov_scan_lidar_urbaning_v2i_vehicle1_finetune.yaml` — fine-tuning
   config (OPTIMIZATION block, `align_weight: 0.0`)
-- `tools/cfgs/nuscenes_models/ov_scan_lidar_urbaning_v2i_vehicle1_finetune_hmw0p5.yaml` — §5.2's
-  `hm_weight=0.5` variant of the above (ruled out — see §5.2)
 - `tools/cfgs/dataset_configs/urbaning_v2x_v2i_vehicle1_multiseq_dataset.yaml` — dataset config
   pointing at the merged multi-sequence dataset
-- `tools/sweep_score_threshold.py` — §5.3's precision/recall-at-threshold sweep tool (distinct from
-  AP, which is threshold-invariant by construction)
 - `tools/investigate_cross_class_fps.py` — the cross-class IoU-matching diagnostic used in §5.1,
-  §5.2, and (with the `--min_score` filter added in §5.3) §5.3, kept as a general reusable tool
-  (any class/checkpoint/confidence-slice comparison, not just `van`)
+  kept as a general reusable tool (any class/checkpoint/confidence-slice comparison, not just
+  `van`); later extended with a `--min_score` filter in
+  [Phase 8](Urbaning_PHASE_8.md) §2
+
+See [Phase 8](Urbaning_PHASE_8.md) §4 and [Phase 9](Urbaning_PHASE_9.md) §7 for files from the
+follow-up fix attempts (`..._finetune_hmw0p5.yaml`, `tools/sweep_score_threshold.py`,
+`..._finetune_lowlr.yaml`, `--freeze_backbone`).
 
 **Modified files:**
 - `pcdet/datasets/nuscenes/nuscenes_dataset.py` — `create_nuscenes_info` gained the optional
