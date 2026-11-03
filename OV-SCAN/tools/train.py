@@ -43,6 +43,11 @@ def parse_config():
     parser.add_argument('--freeze_backbone', action='store_true', default=False,
                          help='freeze vfe/backbone_3d/map_to_bev_module/backbone_2d (requires_grad=False '
                               'and pinned eval mode); only dense_head trains. Phase 9 ablation flag.')
+    parser.add_argument('--train_alignment_only', action='store_true', default=False,
+                         help='freeze vfe/backbone_3d/map_to_bev_module/backbone_2d PLUS every '
+                              'dense_head submodule except alignment_head (shared_conv, heatmap_head, '
+                              'class_encoding, object_decoder, prediction_head); only '
+                              'dense_head.alignment_head trains. Phase 10 ablation flag.')
     parser.add_argument('--ckpt_save_interval', type=int, default=1, help='number of training epochs')
     parser.add_argument('--local-rank', type=int, default=None, help='local rank for distributed training')
     parser.add_argument('--max_ckpt_save_num', type=int, default=30, help='max number of saved checkpoint')
@@ -163,6 +168,34 @@ def main():
             module.train = (lambda self, mode=True: self).__get__(module)
         logger.info('==> --freeze_backbone: froze %s (requires_grad=False + pinned eval mode); '
                     'only dense_head remains trainable' % frozen_module_names)
+
+    if args.train_alignment_only:
+        frozen_module_names = ['vfe', 'backbone_3d', 'map_to_bev_module', 'backbone_2d']
+        frozen_dense_head_submodule_names = [
+            'shared_conv', 'heatmap_head', 'class_encoding', 'object_decoder', 'prediction_head']
+        for name in frozen_module_names:
+            module = getattr(model, name, None)
+            if module is None:
+                continue
+            for p in module.parameters():
+                p.requires_grad = False
+            module.eval()
+            module.train = (lambda self, mode=True: self).__get__(module)
+        for name in frozen_dense_head_submodule_names:
+            module = getattr(model.dense_head, name, None)
+            if module is None:
+                continue
+            for p in module.parameters():
+                p.requires_grad = False
+            module.eval()
+            # Same BatchNorm-drift reasoning as --freeze_backbone above: dense_head's own convs
+            # (shared_conv/heatmap_head/prediction_head) use BatchNorm too, so pin .train() to a
+            # no-op here as well. alignment_head is deliberately left out of both lists -- it's
+            # the only dense_head submodule meant to keep training.
+            module.train = (lambda self, mode=True: self).__get__(module)
+        logger.info('==> --train_alignment_only: froze %s and dense_head.%s (requires_grad=False '
+                    '+ pinned eval mode); only dense_head.alignment_head remains trainable'
+                    % (frozen_module_names, frozen_dense_head_submodule_names))
 
     optimizer = build_optimizer(model, cfg.OPTIMIZATION)
 
