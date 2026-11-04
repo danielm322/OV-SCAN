@@ -215,6 +215,16 @@ class OVScanHead(nn.Module):
         self.bn_momentum = self.model_cfg.BN_MOMENTUM
         self.nms_kernel_size = self.model_cfg.NMS_KERNEL_SIZE
 
+        # Phase 11 Lever 2: optional per-class cap on how many of the num_proposals=200 global
+        # slots a single heatmap channel may contribute (predict(), before the global argsort).
+        # Opt-in and empty by default -- exact prior behavior for every config that doesn't set it
+        # (including every nuScenes config). Fixes the "car channel floods the fixed budget"
+        # mechanism named in Urbaning_PHASE_7/8.md but never implemented until Phase 11.
+        max_proposals_per_class = self.model_cfg.get('MAX_PROPOSALS_PER_CLASS', None) or {}
+        self.max_proposals_per_class_idx = {
+            class_names.index(name): cap for name, cap in max_proposals_per_class.items()
+        }
+
         num_heads = self.model_cfg.NUM_HEADS
         dropout = self.model_cfg.DROPOUT
         activation = self.model_cfg.ACTIVATION
@@ -229,6 +239,12 @@ class OVScanHead(nn.Module):
         self.loss_cls_weight = self.model_cfg.LOSS_CONFIG.LOSS_WEIGHTS['cls_weight']
         self.loss_align = nn.CosineEmbeddingLoss()
         self.loss_align_weight = self.model_cfg.LOSS_CONFIG.LOSS_WEIGHTS['align_weight']
+        # Phase 11 Lever 1: weight for the new same-bucket pseudo-labeled cross-entropy term
+        # (loss(), below) that pushes clip_pred away from OTHER classes reachable from the same
+        # heatmap bucket (e.g. car vs van), not just toward its own positive target. Defaults to
+        # 0.0 -- exact prior positive-only behavior for every config that doesn't set it
+        # (including every existing Urbaning/nuScenes config).
+        self.loss_align_neg_weight = self.model_cfg.LOSS_CONFIG.LOSS_WEIGHTS.get('align_neg_weight', 0.0)
         self.loss_bbox = loss_utils.L1Loss()
         self.loss_bbox_weight = self.model_cfg.LOSS_CONFIG.LOSS_WEIGHTS['bbox_weight']
         self.loss_heatmap = loss_utils.GaussianFocalLoss()
@@ -420,7 +436,23 @@ class OVScanHead(nn.Module):
             local_max[ :, 2, ] = F.max_pool2d(heatmap[:, 2], kernel_size=1, stride=1, padding=0)
         heatmap = heatmap * (heatmap == local_max)
         heatmap = heatmap.view(batch_size, heatmap.shape[1], -1)
- 
+
+        # Phase 11 Lever 2: cap each configured channel's contribution to the global
+        # top-num_proposals selection below, so one over-firing channel (e.g. 'car') can't flood
+        # the fixed 200-slot budget with near-zero noise. No-op for any channel without a
+        # configured cap (self.max_proposals_per_class_idx is empty by default). Selects by INDEX
+        # (torch.topk().indices + scatter_), not by thresholding on the k-th largest VALUE --
+        # large flat background regions of this heatmap routinely produce many cells with the
+        # exact same (often 0.0) activation, so a value threshold lets every tied cell through
+        # and silently caps at a count well above `cap` (empirically caught during this phase's
+        # verification: 100-cap configured, up to 118 survivors with the value-threshold version).
+        for class_idx, cap in self.max_proposals_per_class_idx.items():
+            channel = heatmap[:, class_idx, :]
+            k = min(cap, channel.shape[-1])
+            topk_idx = torch.topk(channel, k=k, dim=-1).indices
+            keep_mask = torch.zeros_like(channel, dtype=torch.bool).scatter_(-1, topk_idx, True)
+            heatmap[:, class_idx, :] = torch.where(keep_mask, channel, torch.zeros_like(channel))
+
         # top num_proposals among all classes
         top_proposals = heatmap.view(batch_size, -1).argsort(dim=-1, descending=True)[
             ..., : self.num_proposals
@@ -686,6 +718,7 @@ class OVScanHead(nn.Module):
         bboxes_formated = self.get_bboxes(pred_dicts, filter=False)
         clip_target_features = []
         clip_pred_features = []
+        clip_bucket_ids = []  # 0-indexed class_names id of the GT box, one per matched positive
         batch_ids = np.arange(len(bboxes_formated))
         pred_labels_list = torch.tensor([], dtype=torch.long).cuda()
         gt_labels_list = torch.tensor([], dtype=torch.long).cuda()
@@ -701,23 +734,28 @@ class OVScanHead(nn.Module):
             gt_labels  = labels[batch_id][pos_ind] + 1
             pred_labels_list = torch.cat((pred_labels_list, pred_labels), dim=0)
             gt_labels_list = torch.cat((gt_labels_list, gt_labels), dim=0)
-            
+
             # Alignment selection
             clip_predictions = pred_dicts['clip_preds'][batch_id][pos_ind]
+            gt_buckets_0idx = labels[batch_id][pos_ind]  # 0-indexed, matches heatmap_to_vocab_mask rows
             clip_matched_preds = []
             clip_image_embeddings = []
-            for alignment_crop, clip_pred, gt_label, pred_labels in zip(grounding_sam, clip_predictions, gt_labels, pred_labels):
+            clip_matched_buckets = []
+            for alignment_crop, clip_pred, gt_label, pred_labels, gt_bucket in zip(
+                    grounding_sam, clip_predictions, gt_labels, pred_labels, gt_buckets_0idx):
                 if not alignment_crop:
                     continue
                 # Load object image embedding from CLIP
                 alignment_obj_embedding = torch.load(alignment_crop['object_embedding_path']).cuda()
                 clip_image_embeddings.append(alignment_obj_embedding)
                 clip_matched_preds.append(clip_pred)
+                clip_matched_buckets.append(gt_bucket)
                 gt_labels_interest.append(gt_label)
                 pred_labels_interest.append(pred_labels)
 
             clip_target_features.extend(clip_image_embeddings)
             clip_pred_features.extend(clip_matched_preds)
+            clip_bucket_ids.extend(clip_matched_buckets)
 
         # Compute alignment loss
         if len(clip_target_features) != 0:
@@ -726,6 +764,36 @@ class OVScanHead(nn.Module):
             loss_align = self.loss_align(clip_pred_features, clip_target_features, torch.ones(clip_pred_features.shape[0]).cuda())
             loss_dict["loss_align"] = loss_align.item() * self.loss_align_weight
             loss_all += loss_align * self.loss_align_weight
+
+            # Phase 11 Lever 1: same-bucket hard-negative term. Positive-only supervision above
+            # gives clip_pred no reason to stay SEPARATED from other classes reachable from the
+            # same heatmap bucket (e.g. car vs van; truck vs bus vs trailer vs other_vehicle) --
+            # plausibly why Phase 10 collapsed the top1-vs-runner-up margin used for score
+            # rescaling (ov_margin, predict()) and reallocated truck-bucket argmax noisily.
+            # Ground-truth fine-grained OV labels aren't available at this point (the dataset only
+            # carries the coarse 10-way bucket id this far), so derive a pseudo fine-label for the
+            # REAL crop embedding via CLIP's own pretrained zero-shot classification (restricted
+            # to the GT's own bucket), then train clip_pred with ordinary cross-entropy against
+            # that pseudo-label. This directly maximizes the margin between the pseudo-correct
+            # class and every other reachable class in the same bucket -- the exact quantity
+            # ov_margin measures at inference -- without needing any new dataset annotation.
+            if self.loss_align_neg_weight > 0:
+                bucket_ids_t = torch.stack(clip_bucket_ids).long().cuda()
+                bucket_mask = self.heatmap_to_vocab_mask[bucket_ids_t]  # (N, num_ov), bool
+                valid = bucket_mask.any(dim=-1)  # exclude suppressed/no-vocab buckets
+                if valid.any():
+                    bucket_mask_v = bucket_mask[valid]
+                    clip_target_v = clip_target_features[valid]
+                    clip_pred_v = clip_pred_features[valid]
+                    with torch.no_grad():
+                        normalized_targets = clip_target_v / clip_target_v.norm(dim=-1, keepdim=True)
+                        target_logits = (normalized_targets @ self.text_features.t()).masked_fill(~bucket_mask_v, float('-inf'))
+                        pseudo_labels = target_logits.argmax(dim=-1)
+                    normalized_preds = clip_pred_v / clip_pred_v.norm(dim=-1, keepdim=True)
+                    pred_logits = (self.clip_logit_scale_exp * normalized_preds @ self.text_features.t()).masked_fill(~bucket_mask_v, float('-inf'))
+                    loss_align_neg = F.cross_entropy(pred_logits, pseudo_labels)
+                    loss_dict["loss_align_neg"] = loss_align_neg.item() * self.loss_align_neg_weight
+                    loss_all += loss_align_neg * self.loss_align_neg_weight
 
         else:
             # Ensure the clip predictions are apart of loss, even if not used
