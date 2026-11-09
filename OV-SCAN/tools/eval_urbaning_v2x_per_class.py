@@ -108,6 +108,12 @@ def parse_config():
                          help='override DATA_CONFIG.DATA_PATH from --cfg_file (lets one fixed set '
                               'of 6 model configs be reused across many converted sequence '
                               'datasets, instead of one dataset yaml per sequence)')
+    parser.add_argument('--log_proposal_source', action='store_true',
+                         help='Phase 12 Lever B diagnostic: tallies, per heatmap channel, how '
+                              'many raw proposals came from MIN_PROPOSALS_PER_CLASS\'s guaranteed '
+                              'floor vs. the competitive remainder argsort, and prints a summary '
+                              'table at the end. No-op (model never populates proposal_is_floor) '
+                              'unless the loaded cfg_file sets MIN_PROPOSALS_PER_CLASS.')
     add_common_args(parser)
     args = parser.parse_args()
 
@@ -264,6 +270,11 @@ def main():
 
     num_samples = len(test_loader) if args.max_samples is None else min(args.max_samples, len(test_loader))
 
+    # Phase 12 Lever B diagnostic: {class_name: [floor_count, total_count]}, filled only if
+    # --log_proposal_source is set and the model actually populates proposal_is_floor (i.e.
+    # MIN_PROPOSALS_PER_CLASS is configured in cfg_file).
+    proposal_source_counts = defaultdict(lambda: [0, 0])
+
     frames = []
     with torch.no_grad():
         for idx, data_dict in enumerate(test_loader):
@@ -280,6 +291,14 @@ def main():
             pred_boxes = pred['pred_boxes'].cpu().numpy()
             pred_scores = pred['pred_scores'].cpu().numpy()
             pred_native = [PRED_NATIVE_TO_CANONICAL.get(s) for s in pred['ov_str_labels']]
+
+            if args.log_proposal_source and 'proposal_is_floor' in pred:
+                is_floor = pred['proposal_is_floor'].cpu().numpy()
+                buckets = pred['heatmap_bucket'].cpu().numpy()
+                for bucket_idx, floor_flag in zip(buckets, is_floor):
+                    counts = proposal_source_counts[cfg.CLASS_NAMES[bucket_idx]]
+                    counts[0] += int(floor_flag)
+                    counts[1] += 1
 
             native_categories = native_categories_by_sample.get(sample_token, [])
             gt_names = test_set.infos[idx]['gt_names']
@@ -367,6 +386,25 @@ def main():
     mlflow.log_metrics(mlflow_metrics)
     mlflow.log_artifact(str(save_path))
     logger.info(f'Wrote {save_path}')
+
+    if args.log_proposal_source:
+        min_per_class = cfg.MODEL.DENSE_HEAD.get('MIN_PROPOSALS_PER_CLASS', None) or {}
+        if proposal_source_counts:
+            logger.info('=== Phase 12 Lever B: proposal source (floor vs. competitive remainder) ===')
+            for class_name in cfg.CLASS_NAMES:
+                if class_name not in proposal_source_counts:
+                    continue
+                floor_n, total_n = proposal_source_counts[class_name]
+                configured_floor = min_per_class.get(class_name)
+                logger.info(
+                    f'{class_name:>18s}: floor={floor_n:7d}  total={total_n:7d}  '
+                    f'floor_share={floor_n / total_n:.3f}'
+                    + (f'  (configured floor_k={configured_floor}/frame)' if configured_floor else '')
+                )
+        else:
+            logger.info('--log_proposal_source set, but no proposal ever carried proposal_is_floor '
+                        '-- MIN_PROPOSALS_PER_CLASS is likely unset in this cfg_file.')
+
     logger.info('Done.')
     mlflow.end_run()
 

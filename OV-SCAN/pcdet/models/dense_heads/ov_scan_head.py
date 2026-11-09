@@ -225,6 +225,25 @@ class OVScanHead(nn.Module):
             class_names.index(name): cap for name, cap in max_proposals_per_class.items()
         }
 
+        # Phase 12 Lever B: optional per-class FLOOR on how many of the num_proposals=200 global
+        # slots a channel is GUARANTEED (predict(), before the global argsort) -- a structural
+        # fix, unlike Phase 11's MAX_PROPOSALS_PER_CLASS ceiling, which can only stop a channel
+        # from flooding the pool but can never guarantee another channel's share of it. Opt-in and
+        # empty by default -- exact prior behavior for every config that doesn't set it.
+        min_proposals_per_class = self.model_cfg.get('MIN_PROPOSALS_PER_CLASS', None) or {}
+        self.min_proposals_per_class_idx = {
+            class_names.index(name): floor for name, floor in min_proposals_per_class.items()
+        }
+
+        # Phase 12: generalizes the old hardcoded nuScenes-index (8,9) / Waymo-index (1,2)
+        # full-resolution-NMS special case below into a config-driven list, resolved by class
+        # NAME instead of a baked-in index -- required for any taxonomy whose class count/order
+        # differs from stock nuScenes/Waymo (e.g. Phase 12's A1/A2 reallocated heatmap channels).
+        # Opt-in and empty by default; every existing nuScenes/Waymo config keeps using the
+        # original hardcoded branches below unchanged.
+        full_res_nms_classes = self.model_cfg.get('FULL_RES_NMS_CLASSES', None) or []
+        self.full_res_nms_idx = [class_names.index(name) for name in full_res_nms_classes]
+
         num_heads = self.model_cfg.NUM_HEADS
         dropout = self.model_cfg.DROPOUT
         activation = self.model_cfg.ACTIVATION
@@ -434,6 +453,13 @@ class OVScanHead(nn.Module):
         elif self.dataset_name == "Waymo":
             local_max[ :, 1, ] = F.max_pool2d(heatmap[:, 1], kernel_size=1, stride=1, padding=0)
             local_max[ :, 2, ] = F.max_pool2d(heatmap[:, 2], kernel_size=1, stride=1, padding=0)
+        # Phase 12: generalized, config-driven equivalent of the two hardcoded branches above --
+        # resolved by class NAME (self.full_res_nms_idx) rather than a baked-in index, so a
+        # reallocated taxonomy (different class count/order than stock nuScenes/Waymo) can still
+        # get full-resolution NMS for the classes that need it. No-op (empty list) by default, so
+        # the two branches above remain exactly as before for every existing config.
+        for class_idx in self.full_res_nms_idx:
+            local_max[:, class_idx, ] = F.max_pool2d(heatmap[:, class_idx], kernel_size=1, stride=1, padding=0)
         heatmap = heatmap * (heatmap == local_max)
         heatmap = heatmap.view(batch_size, heatmap.shape[1], -1)
 
@@ -453,10 +479,48 @@ class OVScanHead(nn.Module):
             keep_mask = torch.zeros_like(channel, dtype=torch.bool).scatter_(-1, topk_idx, True)
             heatmap[:, class_idx, :] = torch.where(keep_mask, channel, torch.zeros_like(channel))
 
-        # top num_proposals among all classes
-        top_proposals = heatmap.view(batch_size, -1).argsort(dim=-1, descending=True)[
-            ..., : self.num_proposals
-        ]
+        # Phase 12 Lever B: reserve a guaranteed floor of the num_proposals budget per class
+        # before the competitive global argsort fills the remainder -- a structural fix (unlike
+        # Phase 11's MAX_PROPOSALS_PER_CLASS ceiling, which can only stop a channel from flooding
+        # the shared pool, never guarantee another channel's share of it). No-op for every config
+        # that doesn't set MIN_PROPOSALS_PER_CLASS (self.min_proposals_per_class_idx empty by
+        # default). Uses the same index-based torch.topk selection as the ceiling above, for the
+        # same tie-breaking reason.
+        if self.min_proposals_per_class_idx:
+            num_cells = heatmap.shape[-1]
+            remainder_heatmap = heatmap.clone()
+            floor_flat_indices = []
+            for class_idx, floor in self.min_proposals_per_class_idx.items():
+                channel = heatmap[:, class_idx, :]
+                k = min(floor, channel.shape[-1])
+                topk_idx = torch.topk(channel, k=k, dim=-1).indices
+                floor_flat_indices.append(class_idx * num_cells + topk_idx)
+                keep_mask = torch.zeros_like(channel, dtype=torch.bool).scatter_(-1, topk_idx, True)
+                remainder_heatmap[:, class_idx, :] = torch.where(
+                    keep_mask, torch.zeros_like(channel), channel
+                )
+            floor_proposals = torch.cat(floor_flat_indices, dim=-1)
+            remainder_budget = max(self.num_proposals - floor_proposals.shape[-1], 0)
+            remainder_proposals = remainder_heatmap.view(batch_size, -1).argsort(
+                dim=-1, descending=True
+            )[..., :remainder_budget]
+            top_proposals = torch.cat([floor_proposals, remainder_proposals], dim=-1)[
+                ..., : self.num_proposals
+            ]
+            # Diagnostic only (see --log_proposal_source in eval_urbaning_v2x_per_class.py):
+            # floor_proposals always occupies the first floor_proposals.shape[-1] slots of the
+            # concatenation above (remainder is appended after, and the final truncation to
+            # self.num_proposals only ever trims the remainder side since floor_total <=
+            # self.num_proposals by construction), so a single leading-slice mask is exact, not
+            # an approximation.
+            query_is_floor = torch.zeros_like(top_proposals, dtype=torch.bool)
+            query_is_floor[:, : floor_proposals.shape[-1]] = True
+        else:
+            # top num_proposals among all classes
+            top_proposals = heatmap.view(batch_size, -1).argsort(dim=-1, descending=True)[
+                ..., : self.num_proposals
+            ]
+            query_is_floor = None
         top_proposals_class = top_proposals // heatmap.shape[-1]
         top_proposals_index = top_proposals % heatmap.shape[-1]
         query_feat = lidar_feat_flatten.gather(
@@ -483,6 +547,9 @@ class OVScanHead(nn.Module):
         res_layer = self.prediction_head(global_query_feat)
         res_layer["center"] = res_layer["center"] + query_pos.permute(0, 2, 1)
         res_layer["query_labels"] = top_proposals_class
+        # Phase 12 Lever B diagnostic: per-proposal floor-vs-remainder provenance, None (absent)
+        # when MIN_PROPOSALS_PER_CLASS isn't configured -- see --log_proposal_source.
+        res_layer["query_is_floor"] = query_is_floor
 
         res_layer["query_heatmap_score"] = heatmap.gather(
             index=top_proposals_index[:, None, :].expand(-1, self.num_class, -1),
@@ -834,7 +901,7 @@ class OVScanHead(nn.Module):
 
     def decode_bbox(self, heatmap, rot, dim, center, height, vel,
                     object_feats, clip_preds, ov_labels, clip_logits, filter=False, query_labels=None,
-                    ov_margin=None):
+                    ov_margin=None, query_is_floor=None):
 
         post_process_cfg = self.model_cfg.POST_PROCESSING
         score_thresh = post_process_cfg.SCORE_THRESH
@@ -888,6 +955,10 @@ class OVScanHead(nn.Module):
                 # Original heatmap-predicted coarse bucket (0-indexed), pre-CLIP-relabeling --
                 # diagnostic only, to measure cross-bucket CLIP "leakage".
                 predictions_dict["heatmap_bucket"] = query_labels[i]
+            if query_is_floor is not None:
+                # Phase 12 Lever B diagnostic: which proposals were floor-guaranteed vs won the
+                # competitive remainder argsort -- see --log_proposal_source.
+                predictions_dict["proposal_is_floor"] = query_is_floor[i]
             predictions_dicts.append(predictions_dict)
 
         if filter is False:
@@ -924,6 +995,8 @@ class OVScanHead(nn.Module):
             predictions_dict["ov_str_labels"] = [self.ov_classes[label] for label in predictions_dict['ov_labels']]
             if query_labels is not None:
                 predictions_dict["heatmap_bucket"] = query_labels[i, cmask]
+            if query_is_floor is not None:
+                predictions_dict["proposal_is_floor"] = query_is_floor[i, cmask]
             predictions_dicts.append(predictions_dict)
 
         return predictions_dicts
@@ -955,6 +1028,7 @@ class OVScanHead(nn.Module):
             batch_height, batch_vel, batch_object_feats,
             batch_clip_pred, batch_pred_labels, batch_clip_logits, filter=filter,
             query_labels=preds_dicts['query_labels'], ov_margin=preds_dicts.get('ov_margin', None),
+            query_is_floor=preds_dicts.get('query_is_floor', None),
         )
 
         return ret_dict 

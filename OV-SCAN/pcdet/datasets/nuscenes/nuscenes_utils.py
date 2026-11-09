@@ -37,6 +37,17 @@ map_name_from_general_to_detection = {
     'movable_object.pushable_pullable': 'ignore',
     'movable_object.debris': 'ignore',
     'static_object.bicycle_rack': 'ignore',
+    # Phase 12 Lever A: new general-category strings for UrbanIng-V2X's A1/A2 reallocated
+    # heatmap taxonomies (see tools/urbaning_v2x/convert_to_nuscenes.py's OBJECT_TYPE_TO_NUSCENES
+    # variants). Purely additive -- these strings are never emitted by real nuScenes data, so
+    # they have no effect on any existing nuScenes/Waymo pipeline.
+    'vehicle.van': 'van',
+    'vehicle.heavy_other': 'heavy_other',
+    'vehicle.two_wheeler_minor': 'two_wheeler_minor',
+    'vehicle.cyclist': 'cyclist',
+    'vehicle.bus': 'bus',
+    'vehicle.escooter': 'escooter',
+    'other.ignore': 'ignore',
 }
 
 
