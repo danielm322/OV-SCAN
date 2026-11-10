@@ -24,6 +24,10 @@ def main():
     parser.add_argument('--results_dir', required=True)
     parser.add_argument('--out_path', required=True)
     parser.add_argument('--sequences', required=True, help='comma-separated sequence names')
+    parser.add_argument('--result_suffix', default='',
+                         help='matches build_alignment_crops_for_sequence.py\'s per-sequence '
+                              'output filename when it was run as a non-default variant (e.g. '
+                              '"_occfilt"), so this merge reads the right intermediate files')
     args = parser.parse_args()
 
     with open(args.pkl_path, 'rb') as f:
@@ -32,7 +36,7 @@ def main():
     sequences = args.sequences.split(',')
     token_to_entries = {}
     for sequence in sequences:
-        result_path = Path(args.results_dir) / f'{sequence}_gt_grounding_sam.pkl'
+        result_path = Path(args.results_dir) / f'{sequence}_gt_grounding_sam{args.result_suffix}.pkl'
         with open(result_path, 'rb') as f:
             token_to_entries.update(pickle.load(f))
 

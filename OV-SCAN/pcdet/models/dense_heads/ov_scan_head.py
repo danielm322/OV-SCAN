@@ -356,12 +356,26 @@ class OVScanHead(nn.Module):
         # detections. Unlike MARGIN_THRESH this doesn't change the predicted label, only its rank.
         self.ov_rescale_temperature = self.model_cfg.ALIGNMENT.get('RESCALE_BY_MARGIN_TEMPERATURE', None)
 
-        ov_class_bucket_id = [self.nuscenes_to_label_id[self.ov_to_nuscenes_classes[c]] - 1 for c in self.ov_classes]
-        self.ov_class_bucket_id = torch.tensor(ov_class_bucket_id, dtype=torch.long).cuda()
-        # First-listed OV string per bucket = fallback/default for that bucket's margin gating.
-        self.bucket_default_ov_idx = {}
-        for idx, bucket_id in enumerate(ov_class_bucket_id):
-            self.bucket_default_ov_idx.setdefault(bucket_id, idx)
+        # Phase 13: this block is only meaningful for MARGIN_THRESH's fallback (used nowhere in
+        # this project's configs -- grep confirms it), and only well-defined when every vocab_key
+        # is itself a literal heatmap channel name (true in the old 1:1-vocab world, including
+        # Phase 12's buggy singleton-per-channel A1/A2, where each new vocab_key was coined equal
+        # to its one channel's name). Fix 1's restored many-to-one indirection legitimately uses
+        # vocab_keys (e.g. "bicycle") that aren't any channel's name once several channels share
+        # one vocab_key's candidate list, so self.nuscenes_to_label_id[vocab_key] would KeyError.
+        # Guarded behind the same condition that gates its only consumer (predict(), ~line 587)
+        # so it's skipped whenever MARGIN_THRESH isn't set, instead of eagerly computing something
+        # dead that happens to crash under the restored indirection.
+        if self.ov_margin_thresh is not None:
+            ov_class_bucket_id = [self.nuscenes_to_label_id[self.ov_to_nuscenes_classes[c]] - 1 for c in self.ov_classes]
+            self.ov_class_bucket_id = torch.tensor(ov_class_bucket_id, dtype=torch.long).cuda()
+            # First-listed OV string per bucket = fallback/default for that bucket's margin gating.
+            self.bucket_default_ov_idx = {}
+            for idx, bucket_id in enumerate(ov_class_bucket_id):
+                self.bucket_default_ov_idx.setdefault(bucket_id, idx)
+        else:
+            self.ov_class_bucket_id = None
+            self.bucket_default_ov_idx = {}
 
         # heatmap_to_vocab_mask[h, k] = True iff a proposal whose heatmap channel is h (0-indexed
         # into self.class_names) is allowed to be CLIP-labeled with ov_classes[k]. A heatmap
@@ -632,7 +646,15 @@ class OVScanHead(nn.Module):
         for batch_idx in range(len(gt_bboxes_3d)):
             pred_dict = {}
             for key in pred_dicts.keys():
-                pred_dict[key] = pred_dicts[key][batch_idx : batch_idx + 1]
+                # Phase 13 fix: query_is_floor is None whenever MIN_PROPOSALS_PER_CLASS isn't
+                # configured (Phase 12's Lever B floor is opt-in) -- it's only ever consumed by
+                # the inference-time get_bboxes/decode_bbox path (which already guards it with
+                # `is not None`), never by get_targets_single below, so it's safe to just carry
+                # the None through rather than crash trying to slice it.
+                if pred_dicts[key] is None:
+                    pred_dict[key] = None
+                else:
+                    pred_dict[key] = pred_dicts[key][batch_idx : batch_idx + 1]
             gt_bboxes = gt_bboxes_3d[batch_idx]
             valid_idx = []
             # filter empty boxes

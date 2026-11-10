@@ -48,8 +48,23 @@ import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
+from shapely.geometry import MultiPoint, box as shapely_box
+from shapely.ops import unary_union
 
 CAMERAS = ['front_left', 'front_right', 'left', 'right', 'back_left', 'back_right']
+
+# Class-specific minimum visible-fraction threshold for alignment-target occlusion filtering
+# (OV-SCAN paper Eq 8 / Supplemental Table 7: car/truck/bus=0.5, cyclist/motorcycle=0.4,
+# pedestrian=0.25), mapped onto UrbanIng-V2X's own native category strings -- same keys as
+# GT_NATIVE_TO_CANONICAL in eval_urbaning_v2x_per_class.py. Independently corroborated by this
+# project's own (unused for UrbanIng-V2X) nuScenes-side GROUNDING_SAM_FITNESS_THRESHOLDS in
+# selective_alignment_nuscenes_utils.py, which uses the same vehicle=0.5/pedestrian=0.25 split for
+# a conceptually identical mask-coverage ratio.
+TAU_OCC = {
+    'Car': 0.5, 'Van': 0.5, 'Bus': 0.5, 'Truck': 0.5, 'Trailer': 0.5, 'OtherVehicle': 0.5,
+    'EScooter': 0.4, 'Motorcycle': 0.4, 'Cyclist': 0.4,
+    'Pedestrian': 0.25, 'OtherPedestrians': 0.25,
+}
 
 
 def load_calibration(seq_dir):
@@ -142,6 +157,45 @@ def is_any_corner_visible(px, depth, cam):
     return bool(visible.any()) and bool(in_front.all())
 
 
+def corners_hull(px):
+    """(8,2) projected pixel corners -> their 2D convex hull polygon."""
+    return MultiPoint([tuple(p) for p in px]).convex_hull
+
+
+def visible_fraction(candidate_corners_L, candidate_box_idx, all_boxes, cam):
+    """Fraction of the candidate box's projected, image-clipped silhouette that is NOT covered by
+    any other GT box in the same frame that is nearer the camera. Mean-corner-depth is used as the
+    near/far proxy -- exactly equal to the box's true centroid depth, since mean commutes with the
+    rigid affine `cam['cTl']` map applied in project_box() before any lens distortion."""
+    candidate_px, candidate_depth = project_box(candidate_corners_L, cam)
+    candidate_hull = corners_hull(candidate_px)
+    image_rect = shapely_box(0, 0, cam['width'], cam['height'])
+    candidate_hull = candidate_hull.intersection(image_rect)
+    if candidate_hull.is_empty or candidate_hull.area <= 0:
+        return 0.0
+    candidate_mean_depth = candidate_depth.mean()
+
+    occluder_hulls = []
+    for j, other_box in enumerate(all_boxes):
+        if j == candidate_box_idx:
+            continue
+        other_px, other_depth = project_box(box_corners_in_L(other_box), cam)
+        # Same behind-camera/fisheye-degeneracy guard as is_any_corner_visible -- an occluder
+        # candidate whose projection can't be trusted is simply skipped, not treated as absent.
+        if not (other_depth > 0.1).all():
+            continue
+        if other_depth.mean() >= candidate_mean_depth:
+            continue
+        occluder_hulls.append(corners_hull(other_px))
+
+    if not occluder_hulls:
+        return 1.0
+    occluded_region = unary_union([candidate_hull.intersection(h) for h in occluder_hulls])
+    # max(0.0, ...) guards against floating-point polygon-area noise pushing this very slightly
+    # negative when occluders fully cover the candidate.
+    return max(0.0, 1.0 - occluded_region.area / candidate_hull.area)
+
+
 def best_camera_crop(corners_L, cams, min_box_in_image_ratio):
     best = None
     for cam_name, cam in cams.items():
@@ -186,6 +240,9 @@ def main():
     parser.add_argument('--image_crop_margin', type=float, default=0.1)
     parser.add_argument('--min_pixels', type=int, default=4000)
     parser.add_argument('--max_alignment_range', type=float, default=54.0)
+    parser.add_argument('--disable_occlusion_filter', action='store_true',
+                         help='skip the inter-object visible-fraction occlusion filter entirely '
+                              '(for ablation/comparison against occlusion-filtered runs)')
     parser.add_argument('--debug_crops_dir', type=str, default=None,
                          help='if set, also save the first --debug_crops_limit matched crops as '
                               'PNGs here, for visual spot-checking the projection math')
@@ -207,6 +264,16 @@ def main():
     with open(args.pkl_path, 'rb') as f:
         infos = pickle.load(f)
 
+    native_categories_by_sample = {}
+    if not args.disable_occlusion_filter:
+        nat_cat_path = Path(args.pkl_path).parent / 'native_categories.json'
+        with open(nat_cat_path) as f:
+            native_categories_by_sample = json.load(f)
+        all_native_cats = sorted({c for cats in native_categories_by_sample.values() for c in cats})
+        non_scored = sorted(set(all_native_cats) - set(TAU_OCC))
+        print(f'[{args.sequence}] occlusion filter enabled; native categories found: {all_native_cats} '
+              f'(non-scored, never alignment-eligible, skipped as candidates: {non_scored})')
+
     pattern = re.compile(rf'^samples/LIDAR_TOP/{re.escape(args.sequence)}_fused_vehicle1_(\d+)\.pcd\.bin$')
     seq_infos = []
     for info in infos:
@@ -221,22 +288,40 @@ def main():
 
     results = {}
     num_boxes, num_matched = 0, 0
+    exclusion_counts = {'range': 0, 'non_scored_category': 0, 'ratio': 0, 'pixels': 0, 'occlusion': 0}
     for info, ts_ms in seq_infos:
         col = ts_to_col.get(ts_ms)
         if col is None:
             results[info['token']] = [None] * len(info['gt_boxes'])
             continue
         row = time_sync[col]
+        all_boxes = info['gt_boxes']
+        native_cats = native_categories_by_sample.get(info['token'])
+        if native_cats is not None and len(native_cats) != len(all_boxes):
+            print(f'[{args.sequence}] WARNING: native_categories length mismatch for token '
+                  f'{info["token"]} ({len(native_cats)} vs {len(all_boxes)} gt_boxes) -- skipping '
+                  f'occlusion filtering for this frame only.')
+            native_cats = None
         entries = []
-        for box in info['gt_boxes']:
+        for box_idx, box in enumerate(all_boxes):
             num_boxes += 1
             if np.linalg.norm(box[:2]) >= args.max_alignment_range:
                 entries.append(None)
+                exclusion_counts['range'] += 1
+                continue
+            if native_cats is not None and native_cats[box_idx] not in TAU_OCC:
+                # Non-scored native category (e.g. 'Animal', 'Other') -- pcdet's dataset
+                # __getitem__ drops these before CLASS_NAMES membership ever lets them reach the
+                # alignment loss, so there's no point spending a camera-projection/CLIP pass on
+                # them; skip immediately rather than guessing an arbitrary occlusion threshold.
+                entries.append(None)
+                exclusion_counts['non_scored_category'] += 1
                 continue
             corners_L = box_corners_in_L(box)
             match = best_camera_crop(corners_L, cams, args.min_box_in_image_ratio)
             if match is None:
                 entries.append(None)
+                exclusion_counts['ratio'] += 1
                 continue
             cam_name, crop_box, ratio = match
             cam = cams[cam_name]
@@ -244,7 +329,14 @@ def main():
                 crop_box, args.image_crop_margin, cam['width'], cam['height'])
             if (max_x - min_x) * (max_y - min_y) < args.min_pixels:
                 entries.append(None)
+                exclusion_counts['pixels'] += 1
                 continue
+            if native_cats is not None:
+                vis_frac = visible_fraction(corners_L, box_idx, all_boxes, cam)
+                if vis_frac < TAU_OCC[native_cats[box_idx]]:
+                    entries.append(None)
+                    exclusion_counts['occlusion'] += 1
+                    continue
 
             cam_channel = f'vehicle1_{cam_name}_camera'
             img_filename = row[cam_channel]
@@ -252,7 +344,7 @@ def main():
             image = np.array(Image.open(img_path))[min_y:max_y, min_x:max_x]
 
             if debug_crops_dir and num_debug_saved < args.debug_crops_limit:
-                gt_name = info['gt_names'][len(entries)]
+                gt_name = info['gt_names'][box_idx]
                 debug_path = debug_crops_dir / f'{args.sequence}_{num_boxes}_{gt_name}_{cam_name}.png'
                 Image.fromarray(image).save(debug_path)
                 num_debug_saved += 1
@@ -278,8 +370,14 @@ def main():
         pickle.dump(results, f)
 
     coverage = num_matched / num_boxes if num_boxes else 0.0
+    num_excluded = num_boxes - num_matched
+    excl_str = ', '.join(
+        f'{reason}={count} ({count / num_excluded:.1%} of exclusions)' if num_excluded else f'{reason}={count}'
+        for reason, count in exclusion_counts.items()
+    )
     print(f'[{args.sequence}] {num_matched}/{num_boxes} boxes matched ({coverage:.1%} coverage), '
           f'saved to {args.out_path}')
+    print(f'[{args.sequence}] exclusion breakdown: {excl_str}')
 
 
 if __name__ == '__main__':

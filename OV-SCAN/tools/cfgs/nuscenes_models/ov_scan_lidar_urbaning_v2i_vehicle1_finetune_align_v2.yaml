@@ -1,0 +1,181 @@
+CLASS_NAMES: ['car','truck', 'construction_vehicle', 'bus', 'trailer',
+              'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
+
+DATA_CONFIG:
+    _BASE_CONFIG_: cfgs/dataset_configs/urbaning_v2x_v2i_vehicle1_multiseq_dataset.yaml
+    POINT_CLOUD_RANGE: [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
+
+    # Phase 13 ("Phase 10'"): identical to finetune_align.yaml except INFO_PATH.train, which now
+    # points at the occlusion-filtered alignment-crop pkl (tools/urbaning_v2x/
+    # build_alignment_crops_for_sequence.py's new inter-object visible-fraction filter, Eq 8 of the
+    # OV-SCAN paper -- see Urbaning_PHASE_13.md). Isolates the occlusion-filter-only effect against
+    # the original Phase 10 checkpoint; vocab is already multi-item here, so Fix 1 (vocab
+    # restoration) doesn't apply to this config. val stays on the original pkl -- eval never calls
+    # loss(), so it never touches gt_grounding_sam.
+    INFO_PATH: {
+        'train': [nuscenes_infos_1sweeps_train_full_ov_task_occfilt.pkl],
+        'test': [nuscenes_infos_1sweeps_val.pkl],
+    }
+
+    # Base dataset config's 3-step list plus filter_alignment_objects (MIN_PIXELS, same threshold
+    # as the real nuScenes alignment configs, e.g. ov_scan_lidar.yaml) -- a load-time
+    # defense-in-depth filter on top of build_alignment_crops_for_sequence.py's own filters
+    # (including the new occlusion filter) at generation time. Must be fully respecified here (not
+    # just the new entry): a child config overriding DATA_PROCESSOR replaces the whole list, it
+    # doesn't append to it.
+    DATA_PROCESSOR:
+        - NAME: mask_points_and_boxes_outside_range
+          REMOVE_OUTSIDE_BOXES: True
+
+        - NAME: shuffle_points
+          SHUFFLE_ENABLED: {
+            'train': True,
+            'test': True
+          }
+
+        - NAME: transform_points_to_voxels
+          VOXEL_SIZE: [0.075, 0.075, 0.2]
+          MAX_POINTS_PER_VOXEL: 10
+          MAX_NUMBER_OF_VOXELS: {
+            'train': 120000,
+            'test': 120000
+          }
+
+        - NAME: filter_alignment_objects
+          MIN_PIXELS: 4000
+
+MODEL:
+    NAME: OVScanLidar
+
+    VFE:
+        NAME: MeanVFE
+
+    BACKBONE_3D:
+        NAME: VoxelResBackBone8x
+        USE_BIAS: False
+
+    MAP_TO_BEV:
+        NAME: HeightCompression
+        NUM_BEV_FEATURES: 256
+
+    BACKBONE_2D:
+        NAME: BaseBEVBackbone
+        LAYER_NUMS: [5, 5]
+        LAYER_STRIDES: [1, 2]
+        NUM_FILTERS: [128, 256]
+        UPSAMPLE_STRIDES: [1, 2]
+        NUM_UPSAMPLE_FILTERS: [256, 256]
+        USE_CONV_FOR_NO_STRIDE: True
+
+
+    DENSE_HEAD:
+        NAME: OVScanHead
+        CLASS_AGNOSTIC: True
+        RETRAIN_HEAD: False
+
+        USE_BIAS_BEFORE_NORM: False
+
+        NUM_PROPOSALS: 200
+        HIDDEN_CHANNEL: 128
+        NUM_CLASSES: 10
+        NUM_HEADS: 8
+        NMS_KERNEL_SIZE: 3
+        FFN_CHANNEL: 256
+        DROPOUT: 0.1
+        BN_MOMENTUM: 0.1
+        ACTIVATION: relu
+
+        ALIGNMENT:
+          CLIP_MODEL: 'hf-hub:apple/DFN5B-CLIP-ViT-H-14'
+          TOKENIZER: 'ViT-H-14'
+          HIDDEN_DIM: 512
+          CLIP_EMBED_DIM: 1024
+          PROMPT: 'a type of CLASS.'
+          CONSTRAIN_TO_HEATMAP_BUCKET: True
+          RESCALE_BY_MARGIN_TEMPERATURE: 0.3
+          HEATMAP_BUCKET_TO_VOCAB_KEYS: {
+            "car": ["car"],
+            "truck": ["truck"],
+            "bus": ["truck"],
+            "trailer": ["truck"],
+            "motorcycle": ["bicycle"],
+            "bicycle": ["bicycle"],
+            "pedestrian": ["pedestrian"],
+          }
+          NUSCENES_TO_OV_CLASSES: {
+            "car": ["car", "van"],
+            "truck": ["truck", "bus", "trailer", "other vehicle"],
+            "bicycle": ["e-scooter", "motorcycle", "cyclist"],
+            "pedestrian": ["pedestrian"],
+          }
+
+        NUM_HM_CONV: 2
+        SEPARATE_HEAD_CFG:
+            HEAD_ORDER: ['center', 'height', 'dim', 'rot', 'vel']
+            HEAD_DICT: {
+                'center': {'out_channels': 2, 'num_conv': 2},
+                'height': {'out_channels': 1, 'num_conv': 2},
+                'dim': {'out_channels': 3, 'num_conv': 2},
+                'rot': {'out_channels': 2, 'num_conv': 2},
+                'vel': {'out_channels': 2, 'num_conv': 2},
+            }
+
+        TARGET_ASSIGNER_CONFIG:
+            FEATURE_MAP_STRIDE: 8
+            DATASET: nuScenes
+            GAUSSIAN_OVERLAP: 0.1
+            MIN_RADIUS: 2
+            HUNGARIAN_ASSIGNER:
+                cls_cost: {'gamma': 2.0, 'alpha': 0.25, 'weight': 0.15}
+                reg_cost: {'weight': 0.25}
+                iou_cost: {'weight': 0.25}
+
+        LOSS_CONFIG:
+            LOSS_WEIGHTS: {
+                    'align_weight': 1.0,
+                    'cls_weight': 0.25,
+                    'bbox_weight': 0.25,
+                    'hm_weight': 1.0,
+                    'code_weights': [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2]
+                }
+            LOSS_SIZE_CLS:
+                use_sigmoid: True
+                gamma: 2.0
+                alpha: 0.25
+
+        POST_PROCESSING:
+            SCORE_THRESH: 0.0
+            POST_CENTER_RANGE: [-61.2, -61.2, -10.0, 61.2, 61.2, 10.0]
+
+    POST_PROCESSING:
+        RECALL_THRESH_LIST: [0.3, 0.5, 0.7]
+        SCORE_THRESH: 0.1
+        OUTPUT_RAW_SCORE: False
+        EVAL_METRIC: kitti
+
+# Phase 13 ("Phase 10'"): identical recipe to Phase 10 -- narrow continuation fine-tune of ONLY
+# dense_head.alignment_head (via --train_alignment_only), starting from Phase 9's adopted checkpoint
+# (v2i_vehicle1_finetune_lowlr_v1/ckpt/checkpoint_epoch_24.pth) via --pretrained_model. Only the
+# training DATA (occlusion-filtered crops) differs from Phase 10; recipe/schedule unchanged so the
+# comparison isolates that one variable.
+OPTIMIZATION:
+    BATCH_SIZE_PER_GPU: 1
+    NUM_EPOCHS: 8
+
+    OPTIMIZER: adam_onecycle
+    LR: 0.0001
+    WEIGHT_DECAY: 0.01
+    MOMENTUM: 0.9
+    BETAS: [0.9, 0.999]
+
+    MOMS: [0.9, 0.8052631]
+    PCT_START: 0.4
+    DIV_FACTOR: 10
+    DECAY_STEP_LIST: [35, 45]
+    LR_DECAY: 0.1
+    LR_CLIP: 0.0000001
+
+    LR_WARMUP: False
+    WARMUP_EPOCH: 1
+
+    GRAD_NORM_CLIP: 35

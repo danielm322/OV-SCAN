@@ -1,0 +1,209 @@
+CLASS_NAMES: ['car', 'van', 'truck', 'heavy_other', 'cyclist', 'two_wheeler_minor', 'pedestrian']
+
+DATA_CONFIG:
+    _BASE_CONFIG_: cfgs/dataset_configs/urbaning_v2x_v2i_vehicle1_multiseq_dataset.yaml
+    DATA_PATH: '../../datasets/urbaning_v2x_v2i_vehicle1_multiseq_a1'
+    POINT_CLOUD_RANGE: [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
+
+    # Phase 13 ("A1'"): same relabeled-taxonomy pkl as a1.yaml (Fix 1 only changes CLIP vocab
+    # routing below, not CLASS_NAMES/gt_names, so no new taxonomy conversion is needed) but pointed
+    # at the occlusion-filtered alignment-crop pkl (merged into this directory from the baseline
+    # directory's occfilt per-sequence results -- crops are keyed by box geometry/token, independent
+    # of class label, same as the original Phase 12 merge). val stays on the plain pkl.
+    INFO_PATH: {
+        'train': [nuscenes_infos_1sweeps_train_full_ov_task_occfilt.pkl],
+        'test': [nuscenes_infos_1sweeps_val.pkl],
+    }
+
+    # Base dataset config's 3-step list plus filter_alignment_objects (MIN_PIXELS, same threshold
+    # as every other alignment-capable config) -- a child config overriding DATA_PROCESSOR
+    # replaces the whole list, it doesn't append to it.
+    DATA_PROCESSOR:
+        - NAME: mask_points_and_boxes_outside_range
+          REMOVE_OUTSIDE_BOXES: True
+
+        - NAME: shuffle_points
+          SHUFFLE_ENABLED: {
+            'train': True,
+            'test': True
+          }
+
+        - NAME: transform_points_to_voxels
+          VOXEL_SIZE: [0.075, 0.075, 0.2]
+          MAX_POINTS_PER_VOXEL: 10
+          MAX_NUMBER_OF_VOXELS: {
+            'train': 120000,
+            'test': 120000
+          }
+
+        - NAME: filter_alignment_objects
+          MIN_PIXELS: 4000
+
+MODEL:
+    NAME: OVScanLidar
+
+    VFE:
+        NAME: MeanVFE
+
+    BACKBONE_3D:
+        NAME: VoxelResBackBone8x
+        USE_BIAS: False
+
+    MAP_TO_BEV:
+        NAME: HeightCompression
+        NUM_BEV_FEATURES: 256
+
+    BACKBONE_2D:
+        NAME: BaseBEVBackbone
+        LAYER_NUMS: [5, 5]
+        LAYER_STRIDES: [1, 2]
+        NUM_FILTERS: [128, 256]
+        UPSAMPLE_STRIDES: [1, 2]
+        NUM_UPSAMPLE_FILTERS: [256, 256]
+        USE_CONV_FOR_NO_STRIDE: True
+
+
+    DENSE_HEAD:
+        NAME: OVScanHead
+        CLASS_AGNOSTIC: True
+        # Phase 12 Lever A: the heatmap-channel count/order changed (10 -> 7), so the final
+        # heatmap conv / class_encoding / prediction_head.heatmap tensors no longer match the
+        # 10-channel checkpoint's shapes. RETRAIN_HEAD: True makes load_params_from_file use
+        # strict=False, reinitializing only those shape-mismatched tensors while transferring
+        # everything else (backbone_3d, backbone_2d, object_decoder, and the entire alignment_head,
+        # whose weights depend only on HIDDEN_CHANNEL/CLIP_EMBED_DIM/NUM_HEADS, never NUM_CLASSES).
+        RETRAIN_HEAD: True
+
+        USE_BIAS_BEFORE_NORM: False
+
+        NUM_PROPOSALS: 200
+        HIDDEN_CHANNEL: 128
+        NUM_CLASSES: 7
+        NUM_HEADS: 8
+        NMS_KERNEL_SIZE: 3
+        # Phase 13 Lever B eval-only sweep (B2), applied on top of this architecture's checkpoint purely at inference time (predict()'s proposal selection) -- never retrained. Same floor values as the original a1_leverb_b2.yaml (channel names unchanged by Fix 1's vocab-only change). See Urbaning_PHASE_13.md.
+        MIN_PROPOSALS_PER_CLASS: {'car': 40, 'van': 25, 'truck': 15, 'heavy_other': 10, 'cyclist': 25, 'two_wheeler_minor': 10, 'pedestrian': 25}
+        FFN_CHANNEL: 256
+        DROPOUT: 0.1
+        BN_MOMENTUM: 0.1
+        ACTIVATION: relu
+
+        # pedestrian is the only channel that still needs full-resolution NMS (its own dedicated
+        # channel, same rationale as the old hardcoded nuScenes pedestrian/traffic_cone special
+        # case) -- resolved by name via FULL_RES_NMS_CLASSES, since the old hardcoded indices
+        # (8, 9) are meaningless under this 7-channel taxonomy.
+        FULL_RES_NMS_CLASSES: ['pedestrian']
+
+        ALIGNMENT:
+          CLIP_MODEL: 'hf-hub:apple/DFN5B-CLIP-ViT-H-14'
+          TOKENIZER: 'ViT-H-14'
+          HIDDEN_DIM: 512
+          CLIP_EMBED_DIM: 1024
+          PROMPT: 'a type of CLASS.'
+          CONSTRAIN_TO_HEATMAP_BUCKET: True
+          RESCALE_BY_MARGIN_TEMPERATURE: 0.3
+          # Phase 13 Fix 1: the only change from a1.yaml. Original A1 made HEATMAP_BUCKET_TO_VOCAB_
+          # KEYS an exact duplicate of NUSCENES_TO_OV_CLASSES (one new singleton vocab_key per new
+          # channel), collapsing car's and van's CLIP candidates down to one each -- the paper's own
+          # Table 4d ablation shows this costs -5.9 mAP (H2SA Stage-2 text-guided alignment
+          # degenerating to a single-candidate scheme). Fix: reuse the many-to-one indirection
+          # exactly as the (multi-item, proven) finetune_align.yaml config already does -- car/van
+          # both route to the same "car" vocab_key's 2-item list, truck/heavy_other both route to
+          # "truck"'s 4-item list, cyclist/two_wheeler_minor both route to the vocab_key named
+          # "cyclist" (renamed from "bicycle" -- that literal channel no longer exists after
+          # Phase 12's rename)'s 3-item list.
+          # NUSCENES_TO_OV_CLASSES below has the exact same *candidate-string lists* as
+          # finetune_align.yaml's (only the dict key for the e-scooter/motorcycle/cyclist group is
+          # renamed, car/truck/pedestrian keys unchanged) -- self.ov_classes/text_features (built
+          # from .values(), never the keys) are byte-identical either way, so
+          # self.ov_classes/self.text_features are identical too -- this ablation now isolates
+          # purely "how many/which Stage-1 heatmap channels", with Stage-2 CLIP disambiguation power
+          # held constant. See Urbaning_PHASE_13.md.
+          HEATMAP_BUCKET_TO_VOCAB_KEYS: {
+            "car": ["car"],
+            "van": ["car"],
+            "truck": ["truck"],
+            "heavy_other": ["truck"],
+            "cyclist": ["cyclist"],
+            "two_wheeler_minor": ["cyclist"],
+            "pedestrian": ["pedestrian"],
+          }
+          NUSCENES_TO_OV_CLASSES: {
+            "car": ["car", "van"],
+            "truck": ["truck", "bus", "trailer", "other vehicle"],
+            "cyclist": ["e-scooter", "motorcycle", "cyclist"],
+            "pedestrian": ["pedestrian", "other pedestrian"],
+          }
+
+        NUM_HM_CONV: 2
+        SEPARATE_HEAD_CFG:
+            HEAD_ORDER: ['center', 'height', 'dim', 'rot', 'vel']
+            HEAD_DICT: {
+                'center': {'out_channels': 2, 'num_conv': 2},
+                'height': {'out_channels': 1, 'num_conv': 2},
+                'dim': {'out_channels': 3, 'num_conv': 2},
+                'rot': {'out_channels': 2, 'num_conv': 2},
+                'vel': {'out_channels': 2, 'num_conv': 2},
+            }
+
+        TARGET_ASSIGNER_CONFIG:
+            FEATURE_MAP_STRIDE: 8
+            DATASET: UrbanIngV2X
+            GAUSSIAN_OVERLAP: 0.1
+            MIN_RADIUS: 2
+            HUNGARIAN_ASSIGNER:
+                cls_cost: {'gamma': 2.0, 'alpha': 0.25, 'weight': 0.15}
+                reg_cost: {'weight': 0.25}
+                iou_cost: {'weight': 0.25}
+
+        LOSS_CONFIG:
+            LOSS_WEIGHTS: {
+                    'align_weight': 1.0,
+                    'cls_weight': 0.25,
+                    'bbox_weight': 0.25,
+                    'hm_weight': 1.0,
+                    'code_weights': [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2]
+                }
+            LOSS_SIZE_CLS:
+                use_sigmoid: True
+                gamma: 2.0
+                alpha: 0.25
+
+        POST_PROCESSING:
+            SCORE_THRESH: 0.0
+            POST_CENTER_RANGE: [-61.2, -61.2, -10.0, 61.2, 61.2, 10.0]
+
+    POST_PROCESSING:
+        RECALL_THRESH_LIST: [0.3, 0.5, 0.7]
+        SCORE_THRESH: 0.1
+        OUTPUT_RAW_SCORE: False
+        EVAL_METRIC: kitti
+
+# Phase 13: full dense_head retrain (RETRAIN_HEAD: True reinitializes the final heatmap
+# conv/class_encoding/prediction_head.heatmap; everything else, including alignment_head,
+# transfers) using --freeze_backbone (vfe/backbone_3d/map_to_bev_module/backbone_2d frozen; rest of
+# dense_head trainable) and --pretrained_model pointed at Phase 10' (finetune_align_v2)'s
+# checkpoint -- NOT the original Phase 10 checkpoint, so A1' inherits the occlusion-filtered
+# alignment_head rather than warm-starting on occlusion-noisy targets before switching. Conservative
+# 7-channel taxonomy -> shorter budget than A2'. See Urbaning_PHASE_13.md.
+OPTIMIZATION:
+    BATCH_SIZE_PER_GPU: 1
+    NUM_EPOCHS: 12
+
+    OPTIMIZER: adam_onecycle
+    LR: 0.0001
+    WEIGHT_DECAY: 0.01
+    MOMENTUM: 0.9
+    BETAS: [0.9, 0.999]
+
+    MOMS: [0.9, 0.8052631]
+    PCT_START: 0.4
+    DIV_FACTOR: 10
+    DECAY_STEP_LIST: [35, 45]
+    LR_DECAY: 0.1
+    LR_CLIP: 0.0000001
+
+    LR_WARMUP: False
+    WARMUP_EPOCH: 1
+
+    GRAD_NORM_CLIP: 35

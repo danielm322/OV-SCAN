@@ -122,37 +122,31 @@ def extract_camera_data(sequence):
     log(f'  [extract] {sequence}: camera data extracted')
 
 
-def process_sequence(sequence):
+def process_sequence(sequence, variant_suffix, disable_occlusion_filter):
     save_root_container = (f'{CONTAINER_MERGED_ROOT}/ov_alignment/{CLIP_MODEL_TAG}/'
-                            f'object_crops/train')
+                            f'object_crops/train{variant_suffix}')
     pkl_container_path = f'{CONTAINER_MERGED_ROOT}/{VERSION}/{TRAIN_PKL_NAME}'
-    out_path_container = f'{CONTAINER_RAW_ROOT}/{sequence}_gt_grounding_sam.pkl'
-    docker_exec(['python', 'urbaning_v2x/build_alignment_crops_for_sequence.py',
-                 '--seq_dir', f'{CONTAINER_RAW_ROOT}/dataset/{sequence}',
-                 '--sequence', sequence,
-                 '--pkl_path', pkl_container_path,
-                 '--save_root', save_root_container,
-                 '--out_path', out_path_container])
+    out_path_container = f'{CONTAINER_RAW_ROOT}/{sequence}_gt_grounding_sam{variant_suffix}.pkl'
+    cmd = ['python', 'urbaning_v2x/build_alignment_crops_for_sequence.py',
+           '--seq_dir', f'{CONTAINER_RAW_ROOT}/dataset/{sequence}',
+           '--sequence', sequence,
+           '--pkl_path', pkl_container_path,
+           '--save_root', save_root_container,
+           '--out_path', out_path_container]
+    if disable_occlusion_filter:
+        cmd.append('--disable_occlusion_filter')
+    docker_exec(cmd)
 
 
-def load_progress():
-    if PROGRESS_PATH.exists():
-        return json.loads(PROGRESS_PATH.read_text())
-    return {'done_sequences': []}
-
-
-def save_progress(progress):
-    PROGRESS_PATH.write_text(json.dumps(progress))
-
-
-def merge_all(sequences):
+def merge_all(sequences, variant_suffix, out_pkl_name):
     pkl_container_path = f'{CONTAINER_MERGED_ROOT}/{VERSION}/{TRAIN_PKL_NAME}'
-    out_path_container = f'{CONTAINER_MERGED_ROOT}/{VERSION}/{OUT_PKL_NAME}'
+    out_path_container = f'{CONTAINER_MERGED_ROOT}/{VERSION}/{out_pkl_name}'
     docker_exec(['python', 'urbaning_v2x/merge_alignment_crops.py',
                  '--pkl_path', pkl_container_path,
                  '--results_dir', CONTAINER_RAW_ROOT,
                  '--out_path', out_path_container,
-                 '--sequences', ','.join(sequences)])
+                 '--sequences', ','.join(sequences),
+                 '--result_suffix', variant_suffix])
 
 
 def main():
@@ -161,13 +155,26 @@ def main():
     parser.add_argument('--skip-merge', action='store_true',
                          help='process sequences but skip the final merge step (e.g. for a '
                               'single-sequence smoke test)')
+    parser.add_argument('--disable-occlusion-filter', action='store_true',
+                         help='pass through to build_alignment_crops_for_sequence.py to skip the '
+                              'inter-object occlusion filter (Phase 13); default is filter ON')
+    parser.add_argument('--variant', type=str, default='',
+                         help='suffix (e.g. "occfilt") distinguishing this run\'s progress '
+                              'marker, per-sequence intermediate results, embedding save dir, and '
+                              'output pkl name from a prior run -- so re-running with different '
+                              'filter settings never silently overwrites or skips against an '
+                              'earlier variant\'s already-processed sequences/files.')
     args = parser.parse_args()
+    variant_suffix = f'_{args.variant}' if args.variant else ''
+    out_pkl_name = f'{Path(OUT_PKL_NAME).stem}{variant_suffix}.pkl'
+    progress_path = PROGRESS_PATH.with_name(f'{PROGRESS_PATH.stem}{variant_suffix}.json')
 
     all_sequences = list_train_sequences()
     sequences = [args.only_sequence] if args.only_sequence else all_sequences
-    log(f'Starting alignment-crop build: {len(sequences)} train sequence(s)')
+    log(f'Starting alignment-crop build: {len(sequences)} train sequence(s), variant={args.variant!r}, '
+        f'occlusion_filter={"disabled" if args.disable_occlusion_filter else "enabled"}')
 
-    progress = load_progress()
+    progress = json.loads(progress_path.read_text()) if progress_path.exists() else {'done_sequences': []}
     done = set(progress['done_sequences'])
 
     for i, sequence in enumerate(sequences, 1):
@@ -177,7 +184,7 @@ def main():
         log(f'--- sequence {i}/{len(sequences)}: {sequence} ---')
 
         extract_camera_data(sequence)
-        process_sequence(sequence)
+        process_sequence(sequence, variant_suffix, args.disable_occlusion_filter)
 
         raw_dir = HOST_RAW_ROOT / 'dataset' / sequence
         if raw_dir.exists():
@@ -186,14 +193,14 @@ def main():
 
         done.add(sequence)
         progress['done_sequences'] = sorted(done)
-        save_progress(progress)
+        progress_path.write_text(json.dumps(progress))
 
     if args.skip_merge:
         log('--skip-merge set, not merging into a full pkl yet.')
         return
 
-    log(f'All {len(sequences)} sequence(s) processed. Merging into {OUT_PKL_NAME}...')
-    merge_all(sorted(done) if not args.only_sequence else sequences)
+    log(f'All {len(sequences)} sequence(s) processed. Merging into {out_pkl_name}...')
+    merge_all(sorted(done) if not args.only_sequence else sequences, variant_suffix, out_pkl_name)
     log('Done.')
 
 

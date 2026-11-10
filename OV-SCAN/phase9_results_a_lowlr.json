@@ -1,0 +1,332 @@
+{
+  "cfg_file": "cfgs/nuscenes_models/ov_scan_lidar_urbaning_v2i_vehicle1_finetune_lowlr.yaml",
+  "match_iou_thresh": 0.25,
+  "num_frames": 1400,
+  "fine_classes": {
+    "bus": {
+      "ap": NaN,
+      "num_gt": 0,
+      "num_pred": 0
+    },
+    "car": {
+      "ap": 0.3966787936567647,
+      "num_gt": 28614,
+      "num_pred": 22272,
+      "final_precision": 0.5325520833333334,
+      "final_recall": 0.4145173691200112
+    },
+    "cyclist": {
+      "ap": 0.7174357691594537,
+      "num_gt": 2566,
+      "num_pred": 28246,
+      "final_precision": 0.07126672803228776,
+      "final_recall": 0.7844894777864381
+    },
+    "escooter": {
+      "ap": 0.0,
+      "num_gt": 518,
+      "num_pred": 0,
+      "final_precision": 0.0,
+      "final_recall": 0.0
+    },
+    "motorcycle": {
+      "ap": 0.0,
+      "num_gt": 40,
+      "num_pred": 1,
+      "final_precision": 0.0,
+      "final_recall": 0.0
+    },
+    "other_pedestrian": {
+      "ap": 0.0,
+      "num_gt": 263,
+      "num_pred": 0,
+      "final_precision": 0.0,
+      "final_recall": 0.0
+    },
+    "other_vehicle": {
+      "ap": NaN,
+      "num_gt": 0,
+      "num_pred": 316
+    },
+    "pedestrian": {
+      "ap": 0.31095401449150106,
+      "num_gt": 6012,
+      "num_pred": 116718,
+      "final_precision": 0.027073801812916604,
+      "final_recall": 0.5256154357950765
+    },
+    "trailer": {
+      "ap": 0.0,
+      "num_gt": 525,
+      "num_pred": 150,
+      "final_precision": 0.0,
+      "final_recall": 0.0
+    },
+    "truck": {
+      "ap": 0.6156483698995834,
+      "num_gt": 1207,
+      "num_pred": 5878,
+      "final_precision": 0.15770670296019054,
+      "final_recall": 0.768019884009942
+    },
+    "van": {
+      "ap": 0.32961173943412714,
+      "num_gt": 5068,
+      "num_pred": 103872,
+      "final_precision": 0.03947165742452249,
+      "final_recall": 0.8089976322020521
+    }
+  },
+  "groups": {
+    "heavy_vehicle": {
+      "ap": 0.4803346546640265,
+      "num_gt": 1732,
+      "num_pred": 6344,
+      "final_precision": 0.15621059268600251,
+      "final_recall": 0.5721709006928406
+    },
+    "pedestrian_group": {
+      "ap": 0.29858353149105793,
+      "num_gt": 6275,
+      "num_pred": 116718,
+      "final_precision": 0.027296560941757055,
+      "final_recall": 0.5077290836653386
+    },
+    "two_wheelers": {
+      "ap": 0.7416655571231905,
+      "num_gt": 3124,
+      "num_pred": 28247,
+      "final_precision": 0.08882359188586399,
+      "final_recall": 0.8031370038412292
+    },
+    "vehicle": {
+      "ap": 0.7817767712686264,
+      "num_gt": 33682,
+      "num_pred": 126144,
+      "final_precision": 0.2235064687975647,
+      "final_recall": 0.8370643073451696
+    }
+  },
+  "mAP_fine_classes": 0.26336985407126995,
+  "mAP_groups": 0.5755901286367253,
+  "by_iou_thresh": {
+    "0.3": {
+      "fine_classes": {
+        "bus": {
+          "ap": NaN,
+          "num_gt": 0,
+          "num_pred": 0
+        },
+        "car": {
+          "ap": 0.38178450516787155,
+          "num_gt": 28614,
+          "num_pred": 22272,
+          "final_precision": 0.5148617097701149,
+          "final_recall": 0.40074788565038094
+        },
+        "cyclist": {
+          "ap": 0.6882706646378997,
+          "num_gt": 2566,
+          "num_pred": 28246,
+          "final_precision": 0.06825745238263825,
+          "final_recall": 0.7513639906469213
+        },
+        "escooter": {
+          "ap": 0.0,
+          "num_gt": 518,
+          "num_pred": 0,
+          "final_precision": 0.0,
+          "final_recall": 0.0
+        },
+        "motorcycle": {
+          "ap": 0.0,
+          "num_gt": 40,
+          "num_pred": 1,
+          "final_precision": 0.0,
+          "final_recall": 0.0
+        },
+        "other_pedestrian": {
+          "ap": 0.0,
+          "num_gt": 263,
+          "num_pred": 0,
+          "final_precision": 0.0,
+          "final_recall": 0.0
+        },
+        "other_vehicle": {
+          "ap": NaN,
+          "num_gt": 0,
+          "num_pred": 316
+        },
+        "pedestrian": {
+          "ap": 0.3050219080383795,
+          "num_gt": 6012,
+          "num_pred": 116718,
+          "final_precision": 0.026242738909165682,
+          "final_recall": 0.5094810379241517
+        },
+        "trailer": {
+          "ap": 0.0,
+          "num_gt": 525,
+          "num_pred": 150,
+          "final_precision": 0.0,
+          "final_recall": 0.0
+        },
+        "truck": {
+          "ap": 0.605908798086463,
+          "num_gt": 1207,
+          "num_pred": 5878,
+          "final_precision": 0.1558353181354202,
+          "final_recall": 0.7589063794531897
+        },
+        "van": {
+          "ap": 0.32631982426968587,
+          "num_gt": 5068,
+          "num_pred": 103872,
+          "final_precision": 0.03903843191620456,
+          "final_recall": 0.8001183898973955
+        }
+      },
+      "groups": {
+        "heavy_vehicle": {
+          "ap": 0.47309791300228377,
+          "num_gt": 1732,
+          "num_pred": 6344,
+          "final_precision": 0.15400378310214377,
+          "final_recall": 0.5640877598152425
+        },
+        "pedestrian_group": {
+          "ap": 0.29234432325950843,
+          "num_gt": 6275,
+          "num_pred": 116718,
+          "final_precision": 0.02631128017957813,
+          "final_recall": 0.489402390438247
+        },
+        "two_wheelers": {
+          "ap": 0.7122307208191243,
+          "num_gt": 3124,
+          "num_pred": 28247,
+          "final_precision": 0.08563741282260064,
+          "final_recall": 0.7743277848911652
+        },
+        "vehicle": {
+          "ap": 0.7569771667709554,
+          "num_gt": 33682,
+          "num_pred": 126144,
+          "final_precision": 0.21702181633688483,
+          "final_recall": 0.8127783385784693
+        }
+      },
+      "mAP_fine_classes": 0.25636730002225555,
+      "mAP_groups": 0.5586625309629679
+    },
+    "0.5": {
+      "fine_classes": {
+        "bus": {
+          "ap": NaN,
+          "num_gt": 0,
+          "num_pred": 0
+        },
+        "car": {
+          "ap": 0.31004684842698593,
+          "num_gt": 28614,
+          "num_pred": 22272,
+          "final_precision": 0.43799389367816094,
+          "final_recall": 0.34091703361990633
+        },
+        "cyclist": {
+          "ap": 0.533816344576994,
+          "num_gt": 2566,
+          "num_pred": 28246,
+          "final_precision": 0.05494583303830631,
+          "final_recall": 0.6048324240062354
+        },
+        "escooter": {
+          "ap": 0.0,
+          "num_gt": 518,
+          "num_pred": 0,
+          "final_precision": 0.0,
+          "final_recall": 0.0
+        },
+        "motorcycle": {
+          "ap": 0.0,
+          "num_gt": 40,
+          "num_pred": 1,
+          "final_precision": 0.0,
+          "final_recall": 0.0
+        },
+        "other_pedestrian": {
+          "ap": 0.0,
+          "num_gt": 263,
+          "num_pred": 0,
+          "final_precision": 0.0,
+          "final_recall": 0.0
+        },
+        "other_vehicle": {
+          "ap": NaN,
+          "num_gt": 0,
+          "num_pred": 316
+        },
+        "pedestrian": {
+          "ap": 0.1855206294846194,
+          "num_gt": 6012,
+          "num_pred": 116718,
+          "final_precision": 0.018326222176528042,
+          "final_recall": 0.35578842315369263
+        },
+        "trailer": {
+          "ap": 0.0,
+          "num_gt": 525,
+          "num_pred": 150,
+          "final_precision": 0.0,
+          "final_recall": 0.0
+        },
+        "truck": {
+          "ap": 0.47981069615587224,
+          "num_gt": 1207,
+          "num_pred": 5878,
+          "final_precision": 0.12912555290915279,
+          "final_recall": 0.6288318144159072
+        },
+        "van": {
+          "ap": 0.3013295992659968,
+          "num_gt": 5068,
+          "num_pred": 103872,
+          "final_precision": 0.036005853357979054,
+          "final_recall": 0.7379636937647988
+        }
+      },
+      "groups": {
+        "heavy_vehicle": {
+          "ap": 0.3763365523736799,
+          "num_gt": 1732,
+          "num_pred": 6344,
+          "final_precision": 0.12815258511979824,
+          "final_recall": 0.4693995381062356
+        },
+        "pedestrian_group": {
+          "ap": 0.1777450238185708,
+          "num_gt": 6275,
+          "num_pred": 116718,
+          "final_precision": 0.018326222176528042,
+          "final_recall": 0.3408764940239044
+        },
+        "two_wheelers": {
+          "ap": 0.5340177706089206,
+          "num_gt": 3124,
+          "num_pred": 28247,
+          "final_precision": 0.06853825184975396,
+          "final_recall": 0.6197183098591549
+        },
+        "vehicle": {
+          "ap": 0.6125283049011245,
+          "num_gt": 33682,
+          "num_pred": 126144,
+          "final_precision": 0.18339358193810248,
+          "final_recall": 0.6868356985927202
+        }
+      },
+      "mAP_fine_classes": 0.20116934643449647,
+      "mAP_groups": 0.425156912925574
+    }
+  }
+}
